@@ -1,0 +1,8 @@
+{
+  "device": "cpu",
+  "experiments": [
+    "closure_matrix"
+  ],
+  "offline": true,
+  "schema_version": 1
+}

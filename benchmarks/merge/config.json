@@ -1,0 +1,8 @@
+{
+  "device": "cpu",
+  "experiments": [
+    "merge"
+  ],
+  "offline": true,
+  "schema_version": 1
+}

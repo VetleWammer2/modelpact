@@ -1,0 +1,9 @@
+{
+  "device": "cpu",
+  "experiments": [
+    "rebase",
+    "rebase_cross_architecture"
+  ],
+  "offline": true,
+  "schema_version": 1
+}
