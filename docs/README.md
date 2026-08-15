@@ -22,12 +22,13 @@ The committed CPU experiments use the module runner directly and work without
 network access after installation:
 
 ```console
-python -m modelpact.pactbench.runner closure_matrix --output artifacts/closure.json
-python -m modelpact.pactbench.runner collusion --output artifacts/collusion.json
-python -m modelpact.pactbench.runner merge --output artifacts/merge.json
-python -m modelpact.pactbench.runner rebase --output artifacts/rebase.json
-python -m modelpact.pactbench.runner rebase_cross_architecture --output artifacts/rebase-cross-architecture.json
-python -m modelpact.pactbench.runner cegis --output artifacts/cegis.json
+python -m modelpact.modelpactbench.runner closure_matrix --output artifacts/closure.json
+python -m modelpact.modelpactbench.runner collusion --output artifacts/collusion.json
+python -m modelpact.modelpactbench.runner merge --output artifacts/merge.json
+python -m modelpact.modelpactbench.runner rebase --output artifacts/rebase.json
+python -m modelpact.modelpactbench.runner rebase_cross_architecture --output artifacts/rebase-cross-architecture.json
+python -m modelpact.modelpactbench.runner cegis --output artifacts/cegis.json
+python -m modelpact.modelpactbench.runner forkbench --output artifacts/forkbench.json --artifacts artifacts/forkbench-run
 ```
 
 The configuration-driven equivalent is:

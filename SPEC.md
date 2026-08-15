@@ -12,12 +12,20 @@ as JSON strings. Hashes are lowercase `sha256:<64 hexadecimal digits>`. YAML is
 an authoring format only; identity is computed after parsing into the normalized
 JSON data model.
 
-Schema v1 rejects unknown fields. A reader encountering a higher
-`schema_version` returns `UNSUPPORTED`; it never silently interprets it as v1.
-Artifact paths are bundle-relative POSIX paths without `.` or `..`, drive names,
-absolute roots, NULs, or symlink traversal. Implementations impose bounded file
-sizes, tensor dimensions, expression depth, collection counts, and integers
-before allocation. Patch data cannot contain Python, callables, pickle, or an
+Unknown-field policy is artifact-specific. Behavior Contract, Delta Program,
+Patch Manifest, and Verification Certificate readers reject unknown fields.
+The current Model Manifest/State Schema readers validate the fields they use but
+tolerate additional fields, and the stack/rebase records do not yet have a
+dedicated normative hostile-data parser. A reader never interprets an unknown
+`schema_version` as v1; command surfaces report unsupported versions as an
+error/non-success state.
+
+Paths embedded in bundles and verification resources are bundle-relative POSIX
+paths without `.` or `..`, drive names, absolute roots, NULs, or symlink
+traversal. A user-selected CLI output path is not an embedded artifact path.
+Readers impose artifact-specific bounds on file sizes, tensor dimensions,
+expression depth, collection counts, and integers before the corresponding
+allocation. Patch data cannot contain Python, callables, pickle, or an
 expression that is evaluated as code.
 
 Stable identities exclude timestamps, output directories, wall-clock timings,
@@ -26,40 +34,51 @@ the underlying patch identity.
 
 ## Model Manifest v1
 
-Required top-level fields are:
+The reference writer emits these top-level fields:
 
 ```text
 schema_version = 1
-adapter_id
-architecture_hash
-state_schema_hash
-checkpoint_hash
-tokenizer_hash
-chat_template_hash
-generation_config_hash
-model_signature
+signature
+  schema_version = 1
+  adapter_id
+  architecture_hash
+  state_schema_hash
+  checkpoint_hash
+  tokenizer_hash
+  chat_template_hash
+  generation_config_hash
 state_schema
-patchable_modules
-non_patchable_persistent_state
-aliases
+checkpoint_tensor_hashes
 parameter_count
+patchable_parameter_count
 dtype_distribution
-runtime_modes
+supported_runtime_modes
+unsupported_state
+metadata
 ```
 
-`checkpoint_hash` covers a sorted sequence of tensor key, shape, dtype, and
-streaming content digest—not a directory name. `architecture_hash` covers the
-canonical model configuration and adapter architecture identity.
-`state_schema_hash` covers every persistent state key and all aliases.
-Tokenizer identity covers tokenizer files and configuration. Chat-template and
-generation-default identities are separate so a deployment-policy change cannot
-hide inside checkpoint identity.
+`signature` is the portable `ModelSignature` object. `checkpoint_hash` is the
+canonical hash of the sorted key-to-tensor-content-hash mapping; each tensor
+content hash covers dtype, shape, and exact contiguous CPU bytes. It is not a
+directory-name identity. `architecture_hash` covers adapter ID, the canonical
+model configuration, and emitted module specifications. `state_schema_hash`
+covers the emitted tensor/module/alias schema. Tokenizer identity covers the
+present files in the v1 allowlist (`tokenizer.json`, tokenizer configuration,
+special/added-token files, vocab/merges, and SentencePiece/tokenizer model
+files). Chat-template and generation-default identities are separate.
 
 An alias group has one canonical state key and a sorted nonempty member set. A
-manifest is invalid if groups overlap, a member is absent from state, shapes or
-dtypes differ, or storage identity no longer agrees with the declared alias.
-Cached fingerprints MAY be reused only after cache inputs—including sizes,
-modification metadata, and canonical file inventory—are revalidated.
+group contains at least two members and uses its lexicographically first member
+as canonical. State-schema parsing checks that every member is a known tensor;
+runtime alias-map construction additionally rejects overlapping groups. Manifests
+built from a live model derive aliases from shared storage identity, but parsing
+a serialized manifest does not independently re-establish storage identity or
+compare alias-member shapes/dtypes. R1 has no fingerprint-cache implementation.
+
+The reader requires the signature, state schema, checkpoint tensor hashes,
+counts, and dtype distribution. It accepts omitted runtime/unsupported/metadata
+fields with empty defaults and currently ignores unknown fields. Consumers MUST
+not assign semantics to such unknown fields.
 
 ## Behavior Contract v1
 
@@ -98,17 +117,25 @@ free_generation_match  reference_kl              base_kl
 generation_length      perplexity
 ```
 
-Every objective and assertion has a unique ID, safe relative source, type, and
-type-specific bounded options. Numeric acceptance thresholds must be finite and
-semantically valid. Unknown objective, assertion, scorer, or option fields are
-rejected. A discrete assertion such as `json_schema` cannot be relabeled as a
-differentiable objective; its compile proxy is separately declared.
+Objective IDs are unique within the compile list; assertion IDs are unique
+across targets and guards (an objective and assertion may share text). Every
+node has a bounded source string, a type, and type-specific bounded options.
+Source confinement is enforced when the
+resource is opened through `resolve_contract_resource` or the model-backed
+provider; constructing the AST alone does not prove that the string is a safe
+path. Numeric acceptance thresholds must be finite and semantically valid.
+Unknown objective, assertion, scorer, or option fields are rejected. A discrete
+assertion such as `json_schema` cannot be relabeled as a differentiable
+objective; its compile proxy is separately declared.
 
-Holdout sources cannot coincide with any compile, search, validation, or guard
-source. A sealed source can be opened only through a stateful authorization token
-for `final_candidate_only` or `independent_verification`. Opening it consumes the
-token and writes an access record. A holdout failure terminates that contract
-attempt; further optimization requires a new contract version and policy record.
+Holdout sources cannot be identical to an objective, target-assertion, or
+guard-assertion source. A sealed source can be opened only through a stateful
+authorization capability for `final_candidate_only` or explicitly enabled
+`independent_verification`. Authorization consumes one gate; each validated role
+access writes an in-memory access record. The gate cannot be reused after a
+holdout failure, but enforcement of the research rule that a new attempt use a
+new contract version/policy is the responsibility of orchestration and retained
+run records, not a global cryptographic mechanism.
 
 The contract hash is SHA-256 of its complete canonical normalized form.
 
@@ -135,16 +162,20 @@ Operations are `low_rank_matrix`, `sparse_matrix`, `vector`, `alias`, and
 `sum`. Each operation supports shape inference, validation, materialization,
 application, referenced-byte estimation, and canonical serialization.
 
-Low-rank factors have shapes `[out, rank]` and `[rank, in]`, positive bounded
-rank, identical floating dtype, and finite scale. Sparse indices are a strictly
-sorted unique integer `[nnz, 2]` tensor in bounds; values are a floating `[nnz]`
-tensor. Vector deltas are rank one. Alias nodes refer to another program target,
-not a file. Cycles and partial updates to a tied alias group are rejected. Sum
-terms must have the same shape and dtype. Unknown operations are rejected.
+Low-rank factors have shapes `[out, rank]` and `[rank, in]`, positive rank,
+identical floating dtype, and finite scale; file/tensor limits bound their
+allocation. Sparse indices are a strictly sorted unique integer `[nnz, 2]`
+tensor in bounds; values are a floating `[nnz]` tensor. Vector delta tensors are
+rank one. Alias nodes refer to another program target, not a file, and alias
+cycles are rejected. When a model state schema is supplied, partial or
+inconsistent updates to a tied alias group are rejected. Sum terms must have the
+same shape and dtype. Unknown top-level or operation fields and unknown
+operations are rejected.
 
 R1 semantics are exactly additive: applying target expression `e` to state
-tensor `W` produces `W + materialize(e)`. Program order has no behavioral
-semantics.
+tensor `W` produces `W + materialize(e)`. Target-map order has no semantic
+meaning. A `sum` term list is serialized and evaluated in its listed order;
+floating-point reassociation is not claimed to be bitwise invariant.
 
 ## Behavior Patch Bundle v1
 
@@ -163,67 +194,107 @@ apply_patch.py
 verify_patch.py
 ```
 
-Data files listed in `manifest.json.artifact_hashes` are hashed before parsing.
-Unlisted files do not contribute to patch identity and cannot be used to satisfy
-a claim. Generated scripts are conveniences and MUST NOT be executed while
-parsing or verifying a bundle.
+Data files listed in `manifest.json.artifact_hashes` are hashed before the delta
+program and tensors are parsed. Unlisted files do not contribute to patch
+identity and cannot be used to satisfy a claim. Generated scripts are
+conveniences and MUST NOT be executed while parsing or verifying a bundle. The
+low-level constructor/loader can operate on a core bundle; callers that require
+the complete R1 layout must call the complete-bundle check. Release-facing
+compile/extract/rebase packaging paths request that complete check.
 
-The stable patch identity is the SHA-256 of length-delimited canonical manifest
-identity fields, delta-program hash, sorted SafeTensors tensor digests, sorted
-contract hashes, and base signature. The manifest stores no self-referential
-`patch_id` during preimage calculation; after calculation the ID is inserted and
-validated by recomputing the same preimage. Parent, merge, rebase, dependency,
-and source-diff lineage are sorted where order is not semantic.
+The stable patch identity is `hash_canonical(identity_payload)`. The identity
+payload is the manifest payload without `patch_id`, with `artifact_hashes`
+filtered to `delta-program.json`, `tensors.safetensors`, and files below
+`contracts/`. Thus it includes the base signature, schema, tool version, name,
+delta representation, target schema, contract/dependency/lineage identifiers,
+compiler configuration, verification-policy hash, and the exact file hashes of
+the program, SafeTensors container, and contracts. It does not separately hash
+per-tensor digests, and evidence/reports/generated helpers are intentionally
+post-ID artifacts. After calculation the ID is inserted and validated by
+recomputing the same canonical payload. Parent, merge, and dependency lists are
+sorted where order is not semantic.
 
-Mounting validates the base signature, module schema, alias groups, tensor keys,
-shapes, and dtypes. Unknown operations or state are refused. Mounting twice is
-either rejected or returns the existing identical mount; it cannot apply twice.
-Unmount removes parameterizations and leaves the untouched base tensors. Folding
-always targets a new output path, uses temporary same-filesystem files and atomic
-rename, preserves non-weight configuration files, and emits a materialization
-manifest.
+Bundle mounting validates the base signature, module schema, alias groups,
+tensor keys, shapes, and dtypes. Unknown operations or state are refused.
+Mounting a second ModelPact patch on an already mounted model is rejected.
+Unmount removes parameterizations and leaves the untouched base tensors.
+Folding always targets a new output path, uses temporary same-filesystem files
+and directory rename, copies regular top-level non-weight files, and emits a
+materialization manifest. The current implementation loads the checkpoint state
+and patched state in host memory before planning/writing deterministic shards;
+it is not a streaming or constant-memory implementation.
 
 ## Patch Stack Lockfile v1
 
-The canonical JSON lockfile pins:
+The core `StackLock.to_dict()` record contains exactly:
 
 ```text
-schema_version
-base_signature and exact checkpoint_hash
-sorted requested patch IDs and bundle hashes
-contract hashes
-dependency edges
-resolution policy hash
-resolution outcome
-resolved artifact hash, when present
-verification policy hash
-certificate hash
-composition-audit hash
+schema_version = 1
+base_hash
+patch_hashes                 # patch ID -> patch manifest-file hash
+contract_hashes
+resolved_artifact_hash       # nullable
+verification_policy_hash
+resolution
+certificate_hash             # nullable
+audit_hash                   # nullable
 ```
 
+`base_hash` is a caller-supplied base identity; the CLI uses the exact checkpoint
+tensor fingerprint rather than a complete nested `ModelSignature`.
+`patch_hashes` is likewise supplied by `PatchReference`; the CLI maps each patch
+ID to its manifest-file hash. Patch IDs are emitted in sorted mapping order and
+contract hashes are sorted/deduplicated. The current core lock does not serialize
+dependency edges, requested order, repair policy, or a separate resolution-policy
+hash. The CLI adds an `extensions.modelpact_cli` object containing local paths, a
+base-manifest hash, and dependency order; that extension is outside the core
+dataclass.
+
 The user-facing TOML input is declarative. Listed order does not alter additive
-weight semantics. Dependency edges are checked for cycles. Outcomes are limited
-to naïve verified stack, verified composite, partially resolved, static
-contradiction, empirical failure, or unsupported. A lockfile never fetches a
-missing patch or model.
+weight semantics. The library topological sorter rejects missing dependencies
+and cycles. The CLI retains every declared dependency edge and rejects an
+omitted dependency before composition or output creation. Outcomes are
+`NAIVE_ADDITIVE_STACK`,
+`VERIFIED_COMPOSITE_PATCH`, `PARTIALLY_RESOLVED_STACK`,
+`STATIC_CONTRADICTION`, `EMPIRICAL_FAILURE`, or `UNSUPPORTED`. A lockfile never
+fetches a missing patch or model.
+
+There is no dedicated strict `StackLock.from_dict` reader yet. The CLI revert
+reader bounds the file, checks version and required identity/path shapes, and
+accepts extension/unknown fields. Unknown fields have no claim semantics.
 
 ## Verification Certificate v1
 
-A certificate is regenerated by execution; bundled results are never trusted as
-input evidence. Required fields include tool and environment identity, patch and
-base identities, adapter, tokenizer, contract and probe hashes, generation
-policy and seeds, objectives, every target and guard result, holdout and free
-generation results, prompt-level metrics, intervals, counterexample budget and
-findings, active modules/ranks/sparsity/bytes, minimization, composition,
-interaction and rebase results, artifact hashes, warnings, and unsupported
-claims.
+A certificate built from a verification report contains tool and environment
+identity, patch and base identities, adapter, checkpoint/tokenizer/contract/probe
+hashes, verification and generation policy, seeds, compile-objective
+descriptions, target/guard/holdout and free-generation results, prompt-level
+metrics, intervals, counterexample, patch-structure, minimization, composition,
+interaction and rebase records, artifact hashes, warnings, unsupported claims,
+compatibility errors, overall outcome, the verification-result hash, and its own
+content hash. Some subsystem records may explicitly say `NOT_EXECUTED`,
+`UNMINIMIZED`, or `NOT_APPLICABLE`; their presence is not evidence that the
+subsystem ran.
+
+Parsing a bundled certificate validates its strict field set, self-hash, digest
+syntax, known claim names, and selected claim/evidence consistency. It does not
+re-execute a model. `independently_verify` instead hashes a caller-declared
+artifact set, executes the supplied model-backed provider, builds a new
+certificate, and uses any prior certificate only for comparison.
 
 Outcomes are exactly `PASS`, `FAIL`, `INCONCLUSIVE`, `UNSUPPORTED`, and
-`NOT_APPLICABLE`. Only `PASS` satisfies a required assertion. Prompt text MAY be
-redacted, but its hash and output hash are mandatory. A certificate claim must
-be in the claim taxonomy and pass the corresponding structural and execution
-predicate. `GLOBAL_MINIMUM` additionally requires an exhaustive relevant search
-record.
+`NOT_APPLICABLE`. Only `PASS` satisfies a required assertion. Prompt text is not
+stored in prompt metrics; its hash is mandatory. An output hash is present when
+generated text exists, and free-generation records always carry prompt, output,
+token-ID, and generation-policy hashes.
+
+Certificate parsing rejects unknown claim names and directly checks evidence for
+base compatibility, target assertions, preservation assertions, sealed holdout,
+and the presence of free-generation records. Objective-optimized and
+minimized-within-budget claims are emitted by the builder from explicit caller
+booleans; their nested evidence is not yet fully re-derived by the parser.
+`GLOBAL_MINIMUM` is in the shared taxonomy but is not emitted by the builder and
+MUST NOT be asserted by this implementation.
 
 Normative wording is:
 
@@ -232,24 +303,37 @@ Normative wording is:
 
 ## Composition Audit v1
 
-The audit records patch IDs, possible subset count, executed inclusion vectors,
-per-contract signed margins, execution order, model/base identity, initial design,
-surrogate configuration, fitted terms, uncertainty method, active-selection
-trace, failing subsets, and ddmin traces.
+The implemented `AuditResult` records patch IDs, possible nonempty-subset count,
+the nonempty subset budget, an optional empty-stack baseline, ordered executed
+subset evaluations with per-contract signed margins/outcomes, claims, coverage,
+failing subsets, ddmin results/tested candidates, active-proposal scores,
+surrogate-fit summaries, and search-space/budget exhaustion flags. Fit summaries
+contain contract ID, observation count, selected regularization strength,
+cross-validation MSE, and degree; fitted coefficient maps and full bootstrap
+members are not retained. The CLI wraps this record in `audit.json` and hashes it
+from a small manifest, but there is no dedicated hostile-data Audit v1 parser or
+self-contained model/base identity field yet.
 
-`EXHAUSTIVE_COMPOSITION_AUDIT` requires every nonempty subset plus the empty
-stack to have executed. Otherwise the only success-like negative finding is
-`NO_FAILURE_FOUND_WITHIN_BUDGET`, paired with `BUDGETED_COMPOSITION_AUDIT` and
-the exact execution budget. Surrogate predictions cannot populate executed
-outcomes.
+`EXHAUSTIVE_COMPOSITION_AUDIT` currently requires every nonempty subset to have
+executed; the empty-stack baseline is enabled by default and recorded separately,
+but is not part of the code predicate for that claim. Otherwise the only
+success-like negative finding is `NO_FAILURE_FOUND_WITHIN_BUDGET`, paired with
+`BUDGETED_COMPOSITION_AUDIT` and the exact nonempty-subset budget. A budgeted run
+that observes failure instead records `FAILING_SUBSET_FOUND`. Surrogate
+predictions cannot populate executed outcomes.
 
 ## Rebase Evidence v1
 
-Rebase evidence pins source patch/base and target base identities, semantic
-compatibility checks, the direct-transplant artifact and executed result, any
-recompile objectives and budgets, old-patched teacher evidence, new-base guard
-evidence, complexity change, CEGIS/minimization traces, holdout result, and final
-claim.
+The serializable `RebaseEvidence.to_dict()` record contains schema version,
+source patch ID, source/target base hashes, claim, compatibility classification,
+whether direct transfer was attempted and its outcome, whether recompilation was
+attempted, executed step/restart counts, budget exhaustion, old-patched behavior
+margins, new-patched behavior margins, new-base preservation margins, before/
+after complexity summaries, and warnings. It does not currently embed the
+candidate artifact hash, original contracts, CEGIS/minimization traces, or a
+holdout record. There is no dedicated strict Rebase Evidence reader or content
+hash; those richer fields can be carried separately in patch evidence and a
+verification certificate.
 
 `DIRECT_TRANSPLANT_VERIFIED` requires an actually applied delta and passing old
 targets, old guards, and new-base preservation checks. Different architectures
@@ -257,13 +341,36 @@ cannot use tensor transplantation. `SEMANTIC_REBASE_VERIFIED` requires a newly
 compiled patch and passing target/new-base contracts. Optimization failure is
 `REBASE_FAILED` or `REBASE_INCONCLUSIVE`, never proof of impossibility.
 
+These semantics are enforced by the library orchestration when supplied with
+applier, verifier, teacher-builder, and behavioral-recompiler callbacks. The CLI
+implements and packages both the direct verified path and a low-rank behavioral
+recompiler for built-in tiny-to-tiny transfers. That tiny recompiler uses the
+old patched model on declared objective probes, applies the declared target
+objectives and new-base guards, and executes final verification plus the sealed
+holdout when configured. It currently requires one deduplicated guarded contract.
+Custom and Hugging Face adapters can use direct verification, but a failed or
+structurally incompatible transfer needs an explicit trusted recompilation
+backend and is reported as unsupported/inconclusive rather than verified.
+
 ## Security limits
 
-The reference implementation defaults to a maximum JSON/YAML depth of 64, delta
-expression depth 32, 4,096 sum terms, 100,000 program targets, 1 MiB JSONL record,
-64 MiB probe file, 1,000,000 probes, and explicit maximum tensor/file byte
-budgets. Implementations MAY choose lower limits but cannot silently choose
-higher ones when reading untrusted data. YAML aliases, custom tags, duplicate
-keys, and recursive objects are rejected. SafeTensors metadata is data only and
-is bounded before tensor allocation where the library permits.
+Limits are reader-specific. Canonical JSON serialization defaults to depth 64.
+Behavior Contract parsing defaults to 2 MiB, depth 32, 100,000 nodes, 10,000
+object keys, 10,000 objectives, and 50,000 assertions. Verification probe loading
+defaults to a 64 MiB file, 2 MiB line, and 100,000 records; the separate generic
+probe-dataset loader permits 1 MiB lines and up to 1,000,000 probes. Compilation
+JSONL permits a 64 MiB source, 2 MiB record, and 1,000,000 records.
 
+Delta programs permit expression depth 32, 4,096 sum terms, 100,000 targets,
+2,048-character tensor names, and at most `2^34` dense elements for a declared
+sparse shape. SafeTensors loading defaults to 16 GiB per file, 100,000 tensors,
+and `2^40` elements per tensor. Patch manifests are limited to 16 MiB and a
+single supplemental-artifact attachment operation to 512 MiB. These are input
+bounds, not memory-usage guarantees.
+
+YAML anchors/aliases/explicit tags, duplicate YAML/JSON keys, non-finite numbers,
+and recursive objects are rejected by the strict data parser. SafeTensors is
+treated as data only. The loader validates regular-file status, total file size,
+key count/name, and tensor element count, but the current implementation does
+not separately pre-parse and bound every SafeTensors metadata field before
+opening the container.

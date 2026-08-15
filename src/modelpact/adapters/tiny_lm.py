@@ -486,7 +486,7 @@ def train_tiny_causal_lm(
 ) -> tuple[float, ...]:
     """Run deterministic next-token training on a finite local text corpus.
 
-    This deliberately small trainer is the CPU research harness used by PactBench;
+    This deliberately small trainer is the CPU research harness used by ModelPactBench;
     it is not a distributed-training abstraction.
     """
 

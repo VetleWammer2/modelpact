@@ -88,7 +88,7 @@ do not compete with or replace mechanistic explanations.
   representation incompatibility can be more predictive than parameter conflict,
   reinforcing the rule that overlap is diagnostic rather than authoritative.
 - [MergeBench](https://proceedings.neurips.cc/paper_files/paper/2025/hash/91f7f71cb04699f387dc863da42a1fe3-Abstract-Datasets_and_Benchmarks_Track.html)
-  evaluates domain-specialized LLM merging. PactBench instead targets selective
+  evaluates domain-specialized LLM merging. ModelPactBench instead targets selective
   extraction, exact small-pool closure ground truth, higher-order failure search,
   semantic repair, and rebase.
 
@@ -106,4 +106,3 @@ behavioral diff + contract language + constrained patch compilation
 The experiments test whether that integration is useful. They do not assume it
 is universally feasible, safe, minimal, architecture-independent, or superior to
 specialized methods.
-

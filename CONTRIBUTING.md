@@ -32,7 +32,7 @@ python -m pytest
 python -m build
 ```
 
-Run the fast real PactBench experiments when changing compilation, composition,
+Run the fast real ModelPactBench experiments when changing compilation, composition,
 audit, merge, or rebase logic:
 
 ```console

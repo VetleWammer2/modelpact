@@ -1,6 +1,6 @@
 # Semantic merge example
 
-This example uses the same executable configuration schema as PactBench. It
+This example uses the same executable configuration schema as ModelPactBench. It
 demonstrates the distinction between additive composition and a semantic merge:
 the former only sums and verifies, while the latter runs a new optimization
 against the parent contracts.

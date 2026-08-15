@@ -1,10 +1,22 @@
-# PactBench preregistered research protocol
+# ModelPactBench preregistered research protocol
 
 Protocol version 1, recorded before release benchmark results are interpreted.
 All seeds, raw prompt-level results, environment manifests, and unsuccessful runs
 are retained. A single seed cannot support a superiority claim. Paired bootstrap
 intervals use deterministic seeds; multiplicity-adjusted tests are reported only
 when significance language is used.
+
+The benchmark suite was renamed from PactBench to ModelPactBench after a
+namespace check on 2026-08-15 found existing public uses of PactBench/PACTBench.
+This is a practical collision-avoidance decision, not a trademark opinion or
+legal clearance. The namespace must be checked again at the actual release date.
+
+This protocol describes the experiments required to evaluate H1–H6, not claims
+already established by the small deterministic CI organisms. Multi-seed success
+criteria and baseline comparisons remain unmet until the corresponding raw runs
+are committed and analyzed. Analytic merge/audit/rebase organisms establish
+control-flow behavior only and cannot by themselves support language-model or
+method-superiority claims.
 
 ## H1 — Selective extraction
 
@@ -107,7 +119,9 @@ when significance language is used.
 ## Reporting and stopping
 
 Validation is used for candidate selection. A sealed holdout is opened once for
-the final candidate. Failure ends that contract version. Runs stop at explicit
-step, wall-time, memory, CEGIS, or subset budgets. `INCONCLUSIVE` remains distinct
-from pass. Benchmark names and availability are rechecked before publication.
-
+the final candidate. Failure ends that contract version. Current CPU runners
+stop at explicit optimization-step, CEGIS-round/search, or subset budgets and
+record wall time; they do not implement a general in-process wall-time or memory
+interrupt. Larger experiments must declare any external scheduler limits and
+record peak memory separately. `INCONCLUSIVE` remains distinct from pass.
+Benchmark names and availability are rechecked before publication.

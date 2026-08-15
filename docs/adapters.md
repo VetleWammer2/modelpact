@@ -7,7 +7,10 @@ schema. Built-ins cover the internal tiny decoder and safe local Hugging Face
 causal LMs. A custom adapter is referenced as `module:attribute`; importing it
 executes trusted local Python.
 
-Adapters must not hide remote downloads, enable remote code, or omit persistent
-state. Tokenizer, chat-template, generation defaults, aliases, and checkpoint
-tensors all participate in model identity.
-
+The built-in Hugging Face adapter uses local-only loading and disables remote
+code. A custom adapter can perform arbitrary actions, including network access;
+the trusted adapter author is responsible for disclosing that behavior and for
+exposing persistent state correctly. Checkpoint tensors, the state/module schema,
+aliases, an allowlisted set of tokenizer files, chat template, generation
+defaults, architecture configuration, and adapter identity participate in the
+emitted model signature.
