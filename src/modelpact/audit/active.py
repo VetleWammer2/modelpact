@@ -37,6 +37,7 @@ class SubsetEvaluation:
     outcome: VerificationOutcome
     violated_contracts: tuple[str, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
+    result_hash: str | None = None
 
     def __post_init__(self) -> None:
         if not all(math.isfinite(value) for value in self.margins.values()):
@@ -47,6 +48,8 @@ class SubsetEvaluation:
             value < 0.0 for value in self.margins.values()
         ):
             raise ValueError("PASS subset evaluation cannot contain a negative margin")
+        if self.result_hash is not None and not self.result_hash.startswith("sha256:"):
+            raise ValueError("result_hash must be a sha256-prefixed content hash")
 
     @property
     def passed(self) -> bool:
@@ -219,7 +222,24 @@ def select_active_subsets(
     if count <= 0:
         return ()
     universe = validate_patch_universe(patch_ids)
-    dependency_map = dependencies or {}
+    dependency_map = {
+        patch_id: tuple(sorted(set(required)))
+        for patch_id, required in (dependencies or {}).items()
+    }
+    unknown_dependency_keys = set(dependency_map) - set(universe)
+    unknown_dependencies = {item for values in dependency_map.values() for item in values} - set(
+        universe
+    )
+    if unknown_dependency_keys or unknown_dependencies:
+        raise ValueError(
+            "audit dependencies reference unknown patches: "
+            f"{sorted(unknown_dependency_keys | unknown_dependencies)}"
+        )
+
+    def dependency_closed(subset: PatchSubset) -> bool:
+        selected = set(subset)
+        return all(set(dependency_map.get(item, ())) <= selected for item in subset)
+
     executed_vectors = [subset_to_vector(subset, universe) for subset in executed]
     terms = hierarchical_feature_terms(len(universe), degree=degree)
     explored_terms = {
@@ -283,14 +303,37 @@ def audit_patch_pool(
     """
 
     universe = validate_patch_universe(patch_ids)
+    dependency_map = {
+        patch_id: tuple(sorted(set(required)))
+        for patch_id, required in (dependencies or {}).items()
+    }
+    unknown_dependency_keys = set(dependency_map) - set(universe)
+    unknown_dependencies = {item for values in dependency_map.values() for item in values} - set(
+        universe
+    )
+    if unknown_dependency_keys or unknown_dependencies:
+        raise ValueError(
+            "audit dependencies reference unknown patches: "
+            f"{sorted(unknown_dependency_keys | unknown_dependencies)}"
+        )
+
+    def dependency_closed(subset: PatchSubset) -> bool:
+        return _dependencies_satisfied(subset, dependency_map)
+
     if config.subset_budget < len(universe):
         raise ValueError("subset_budget must permit verification of every singleton")
     maximum_order = config.maximum_order or len(universe)
     if maximum_order < 1 or maximum_order > len(universe):
         raise ValueError("maximum_order must be between one and the patch count")
-    possible_count = (1 << len(universe)) - 1
-    all_nonempty = enumerate_subsets(universe)
-    eligible = enumerate_subsets(universe, maximum_order=maximum_order)
+    all_nonempty = tuple(
+        subset for subset in enumerate_subsets(universe) if dependency_closed(subset)
+    )
+    possible_count = len(all_nonempty)
+    eligible = tuple(
+        subset
+        for subset in enumerate_subsets(universe, maximum_order=maximum_order)
+        if dependency_closed(subset)
+    )
     baseline: SubsetEvaluation | None = None
     if config.evaluate_empty_stack:
         baseline = oracle(())
@@ -308,6 +351,8 @@ def audit_patch_pool(
             return baseline
         if canonical in evaluations:
             return evaluations[canonical]
+        if not dependency_closed(canonical):
+            raise ValueError("audit subset omits a declared patch dependency")
         if len(evaluations) >= config.subset_budget:
             raise ReductionBudgetExhausted
         result = oracle(canonical)
@@ -340,6 +385,8 @@ def audit_patch_pool(
             high_risk=high_risk,
         )
         for subset in design:
+            if not dependency_closed(subset):
+                continue
             if len(evaluations) >= config.subset_budget:
                 break
             execute(subset)
@@ -377,7 +424,8 @@ def audit_patch_pool(
         for subset in sorted(initially_failing, key=lambda item: (len(item), item)):
             reduction = ddmin_failing_subset(
                 subset,
-                oracle=lambda candidate: not execute(candidate).passed,
+                oracle=lambda candidate: dependency_closed(candidate)
+                and not execute(candidate).passed,
                 initial_known_failing=True,
             )
             reduction_attempts.append(reduction)

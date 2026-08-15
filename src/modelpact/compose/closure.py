@@ -94,6 +94,10 @@ class CompositionResult:
     degraded_contracts: tuple[str, ...] = ()
     unverified_contracts: tuple[str, ...] = ()
     interaction_margins: Mapping[str, float] = field(default_factory=dict)
+    base_verification: VerificationReport | None = None
+    singleton_verifications: Mapping[str, VerificationReport] = field(default_factory=dict)
+    degradation_tolerance: float | None = None
+    evidence_gaps: tuple[str, ...] = ()
 
     @property
     def closed(self) -> bool:
@@ -197,16 +201,22 @@ def verify_contract_closure(
     contradiction_checker: ContradictionChecker | None = None,
     degradation_tolerance: float | None = None,
     base_margins: Mapping[str, float] | None = None,
+    execute_baselines: bool = False,
 ) -> CompositionResult:
     """Add patches and execute their union contracts.
 
     ``degradation_tolerance`` classifies still-passing but materially reduced
-    margins as ``COMPOSITION_DEGRADED``.  Failed, inconclusive, or unsupported
-    execution is a semantic conflict, never a successful closure claim.
+    margins as ``COMPOSITION_DEGRADED``.  With ``execute_baselines``, the same
+    union contract set is executed on the empty stack and every singleton; this
+    supplies independent baselines and exact pair-interaction margins. Failed,
+    inconclusive, or unsupported composed execution is a semantic conflict,
+    never a successful closure claim.
     """
 
-    if degradation_tolerance is not None and degradation_tolerance < 0:
-        raise ValueError("degradation_tolerance must be non-negative")
+    if degradation_tolerance is not None and (
+        not math.isfinite(degradation_tolerance) or degradation_tolerance < 0
+    ):
+        raise ValueError("degradation_tolerance must be finite and non-negative")
     operand_tuple = tuple(operands)
     patch_ids = tuple(sorted(operand.patch_id for operand in operand_tuple))
     contract_ids = tuple(
@@ -221,6 +231,7 @@ def verify_contract_closure(
             resolved_delta={},
             verification=None,
             structural_errors=errors,
+            degradation_tolerance=degradation_tolerance,
         )
     contradictions = contradiction_checker(contract_ids) if contradiction_checker else ()
     if contradictions:
@@ -231,6 +242,7 @@ def verify_contract_closure(
             resolved_delta={},
             verification=None,
             contradictions=tuple(contradictions),
+            degradation_tolerance=degradation_tolerance,
         )
     try:
         resolved = additive_compose(operand_tuple, aliases=aliases)
@@ -242,7 +254,19 @@ def verify_contract_closure(
             resolved_delta={},
             verification=None,
             structural_errors=(str(error),),
+            degradation_tolerance=degradation_tolerance,
         )
+
+    base_verification: VerificationReport | None = None
+    singleton_verifications: dict[str, VerificationReport] = {}
+    if execute_baselines:
+        # Execute all union contracts at the empty stack and at every singleton.
+        # A singleton will ordinarily fail contracts owned only by another patch;
+        # those signed margins are still necessary for semantic-interaction evidence.
+        base_verification = executor({}, contract_ids)
+        for operand in sorted(operand_tuple, key=lambda item: item.patch_id):
+            singleton_delta = additive_compose((operand,), aliases=aliases)
+            singleton_verifications[operand.patch_id] = executor(singleton_delta, contract_ids)
     report = executor(resolved, contract_ids)
     reported_contracts = set(report.by_contract())
     missing_contracts = tuple(sorted(set(contract_ids) - reported_contracts))
@@ -259,7 +283,17 @@ def verify_contract_closure(
     if claim is CompositionClaim.COMPOSITION_CLOSED and degradation_tolerance is not None:
         parent_baselines: dict[str, float] = {}
         for operand in operand_tuple:
-            for contract_id, operand_margin in operand.verified_margins.items():
+            executed = singleton_verifications.get(operand.patch_id)
+            executed_margins = executed.by_contract() if executed is not None else {}
+            for contract_id in operand.contract_ids:
+                margin = executed_margins.get(contract_id)
+                operand_margin = (
+                    margin.margin
+                    if margin is not None
+                    else operand.verified_margins.get(contract_id)
+                )
+                if operand_margin is None:
+                    continue
                 parent_baselines[contract_id] = min(
                     parent_baselines.get(contract_id, operand_margin), operand_margin
                 )
@@ -271,13 +305,41 @@ def verify_contract_closure(
             claim = CompositionClaim.COMPOSITION_DEGRADED
 
     interactions: dict[str, float] = {}
-    if len(operand_tuple) == 2 and base_margins is not None:
+    evidence_gaps: list[str] = []
+    if len(operand_tuple) == 2:
         final_margins = report.by_contract()
+        ordered_operands = tuple(sorted(operand_tuple, key=lambda item: item.patch_id))
+        left_executed = singleton_verifications.get(ordered_operands[0].patch_id)
+        right_executed = singleton_verifications.get(ordered_operands[1].patch_id)
+        left_executed_margins = left_executed.by_contract() if left_executed is not None else {}
+        right_executed_margins = right_executed.by_contract() if right_executed is not None else {}
+        base_executed_margins = (
+            base_verification.by_contract() if base_verification is not None else {}
+        )
         for contract_id in sorted(final_margins):
-            left = operand_tuple[0].verified_margins.get(contract_id)
-            right = operand_tuple[1].verified_margins.get(contract_id)
-            base = base_margins.get(contract_id)
+            left_margin = left_executed_margins.get(contract_id)
+            right_margin = right_executed_margins.get(contract_id)
+            base_margin = base_executed_margins.get(contract_id)
+            left = (
+                left_margin.margin
+                if left_margin is not None
+                else ordered_operands[0].verified_margins.get(contract_id)
+            )
+            right = (
+                right_margin.margin
+                if right_margin is not None
+                else ordered_operands[1].verified_margins.get(contract_id)
+            )
+            base = (
+                base_margin.margin
+                if base_margin is not None
+                else (base_margins or {}).get(contract_id)
+            )
             if left is None or right is None or base is None:
+                evidence_gaps.append(
+                    f"contract-margin interaction unavailable for {contract_id}: "
+                    "base and both singleton margins are required"
+                )
                 continue
             interactions[contract_id] = contract_margin_interaction(
                 base_margin=base,
@@ -294,4 +356,8 @@ def verify_contract_closure(
         degraded_contracts=tuple(sorted(degraded)),
         unverified_contracts=missing_contracts,
         interaction_margins=interactions,
+        base_verification=base_verification,
+        singleton_verifications=dict(sorted(singleton_verifications.items())),
+        degradation_tolerance=degradation_tolerance,
+        evidence_gaps=tuple(sorted(evidence_gaps)),
     )

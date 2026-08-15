@@ -5,7 +5,25 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, cast
+
+from modelpact.util.hashing import is_sha256_digest
+
+MAX_STACK_LOCK_PATCHES = 4_096
+MAX_STACK_LOCK_CONTRACTS = 100_000
+STACK_LOCK_FIELDS = frozenset(
+    {
+        "audit_hash",
+        "base_hash",
+        "certificate_hash",
+        "contract_hashes",
+        "patch_hashes",
+        "resolution",
+        "resolved_artifact_hash",
+        "schema_version",
+        "verification_policy_hash",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +50,7 @@ class PatchReference:
     contract_hashes: tuple[str, ...]
     artifact_hash: str
     requires: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
     lineage: PatchLineage = field(default_factory=PatchLineage)
 
     def __post_init__(self) -> None:
@@ -43,8 +62,19 @@ class PatchReference:
         )
         if any(not value for value in required):
             raise ValueError("patch reference identities must not be empty")
-        if self.patch_id in self.requires:
-            raise ValueError("a patch cannot depend on itself")
+        for name, values in (
+            ("contract_hashes", self.contract_hashes),
+            ("requires", self.requires),
+            ("provides", self.provides),
+        ):
+            if tuple(sorted(set(values))) != values:
+                raise ValueError(f"patch reference {name} must be sorted and unique")
+
+    @property
+    def provided_contracts(self) -> tuple[str, ...]:
+        """Contracts capable of satisfying another patch's requirements."""
+
+        return self.provides or self.contract_hashes
 
 
 class StackResolutionKind(StrEnum):
@@ -119,6 +149,87 @@ class StackLock:
             "audit_hash": self.audit_hash,
         }
 
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> StackLock:
+        """Strictly parse the data-only core of Patch Stack Lockfile v1."""
+
+        unknown = set(value) - STACK_LOCK_FIELDS
+        missing = STACK_LOCK_FIELDS - set(value)
+        if unknown:
+            raise ValueError(f"unknown Patch Stack Lockfile v1 fields: {sorted(unknown)}")
+        if missing:
+            raise ValueError(f"missing Patch Stack Lockfile v1 fields: {sorted(missing)}")
+        if isinstance(value.get("schema_version"), bool) or value.get("schema_version") != 1:
+            raise ValueError("unsupported Patch Stack Lockfile schema version")
+
+        def required_digest(name: str) -> str:
+            candidate = value.get(name)
+            if not is_sha256_digest(candidate):
+                raise ValueError(f"lockfile {name} must be a tagged SHA-256 digest")
+            return cast(str, candidate)
+
+        def optional_digest(name: str) -> str | None:
+            candidate = value.get(name)
+            if candidate is not None and not is_sha256_digest(candidate):
+                raise ValueError(f"lockfile {name} must be null or a tagged SHA-256 digest")
+            return cast(str | None, candidate)
+
+        raw_patch_hashes = value.get("patch_hashes")
+        if not isinstance(raw_patch_hashes, Mapping):
+            raise ValueError("lockfile patch_hashes must be an object")
+        if len(raw_patch_hashes) > MAX_STACK_LOCK_PATCHES:
+            raise ValueError("lockfile patch count exceeds the limit")
+        patch_hashes: dict[str, str] = {}
+        for patch_id, manifest_hash in raw_patch_hashes.items():
+            if not is_sha256_digest(patch_id) or not is_sha256_digest(manifest_hash):
+                raise ValueError(
+                    "lockfile patch_hashes must map patch SHA-256 identities to "
+                    "manifest SHA-256 digests"
+                )
+            patch_hashes[cast(str, patch_id)] = cast(str, manifest_hash)
+
+        raw_contract_hashes = value.get("contract_hashes")
+        if not isinstance(raw_contract_hashes, list):
+            raise ValueError("lockfile contract_hashes must be an array")
+        if len(raw_contract_hashes) > MAX_STACK_LOCK_CONTRACTS:
+            raise ValueError("lockfile contract count exceeds the limit")
+        if not all(is_sha256_digest(item) for item in raw_contract_hashes):
+            raise ValueError("lockfile contract_hashes must contain tagged SHA-256 digests")
+        contract_hashes = tuple(cast(list[str], raw_contract_hashes))
+        if tuple(sorted(set(contract_hashes))) != contract_hashes:
+            raise ValueError("lockfile contract_hashes must be sorted and unique")
+
+        raw_resolution = value.get("resolution")
+        if not isinstance(raw_resolution, str):
+            raise ValueError("lockfile resolution must be a string")
+        try:
+            resolution = StackResolutionKind(raw_resolution)
+        except ValueError as error:
+            raise ValueError(f"unsupported lockfile resolution: {raw_resolution}") from error
+
+        resolved_artifact_hash = optional_digest("resolved_artifact_hash")
+        if (
+            resolution
+            in {
+                StackResolutionKind.NAIVE_ADDITIVE_STACK,
+                StackResolutionKind.VERIFIED_COMPOSITE_PATCH,
+            }
+            and resolved_artifact_hash is None
+        ):
+            raise ValueError("successful lockfile resolution must pin a resolved artifact")
+
+        return cls(
+            schema_version=1,
+            base_hash=required_digest("base_hash"),
+            patch_hashes=dict(sorted(patch_hashes.items())),
+            contract_hashes=contract_hashes,
+            resolved_artifact_hash=resolved_artifact_hash,
+            verification_policy_hash=required_digest("verification_policy_hash"),
+            resolution=resolution,
+            certificate_hash=optional_digest("certificate_hash"),
+            audit_hash=optional_digest("audit_hash"),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ResolvedStack:
@@ -129,15 +240,31 @@ class ResolvedStack:
 
 
 def dependency_order(patches: tuple[PatchReference, ...] | list[PatchReference]) -> tuple[str, ...]:
-    """Return a stable topological order, rejecting missing dependencies/cycles."""
+    """Order patches by required/provided contract identities."""
 
     by_id = {patch.patch_id: patch for patch in patches}
     if len(by_id) != len(patches):
         raise ValueError("stack contains duplicate patch identities")
+    providers: dict[str, list[str]] = {}
     for patch in patches:
-        missing = sorted(set(patch.requires) - set(by_id))
+        for contract_id in patch.provided_contracts:
+            providers.setdefault(contract_id, []).append(patch.patch_id)
+    for patch in patches:
+        missing = sorted(set(patch.requires) - set(providers))
         if missing:
-            raise ValueError(f"patch {patch.patch_id!r} has missing dependencies: {missing}")
+            raise ValueError(
+                f"patch {patch.patch_id!r} has unsatisfied required contracts: {missing}"
+            )
+        ambiguous = sorted(
+            contract_id
+            for contract_id in patch.requires
+            if len(set(providers[contract_id]) - {patch.patch_id}) > 1
+            and patch.patch_id not in providers[contract_id]
+        )
+        if ambiguous:
+            raise ValueError(
+                f"patch {patch.patch_id!r} has ambiguously provided required contracts: {ambiguous}"
+            )
 
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -149,8 +276,10 @@ def dependency_order(patches: tuple[PatchReference, ...] | list[PatchReference])
         if patch_id in visiting:
             raise ValueError(f"patch dependency cycle contains {patch_id!r}")
         visiting.add(patch_id)
-        for dependency in sorted(by_id[patch_id].requires):
-            visit(dependency)
+        for contract_id in sorted(by_id[patch_id].requires):
+            candidates = sorted(set(providers[contract_id]) - {patch_id})
+            if candidates:
+                visit(candidates[0])
         visiting.remove(patch_id)
         visited.add(patch_id)
         ordered.append(patch_id)

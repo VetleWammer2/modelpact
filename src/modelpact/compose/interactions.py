@@ -13,6 +13,16 @@ from typing import cast
 
 import torch
 
+from modelpact.patch.ast import (
+    Alias,
+    DeltaOp,
+    DeltaProgram,
+    LowRankMatrixDelta,
+    SparseMatrixDelta,
+    Sum,
+    TensorMap,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class SetOverlap:
@@ -48,6 +58,87 @@ class PrincipalAngles:
 class LowRankSubspaceDiagnostics:
     column_space: PrincipalAngles
     row_space: PrincipalAngles
+
+
+def _target_terms(program: DeltaProgram, target: str) -> tuple[DeltaOp, ...]:
+    """Flatten safe delta operations for one target, following declared aliases."""
+
+    active: set[str] = set()
+
+    def visit_target(name: str) -> tuple[DeltaOp, ...]:
+        if name in active:
+            raise ValueError(f"delta alias cycle at {name}")
+        operation = program.targets.get(name)
+        if operation is None:
+            raise ValueError(f"delta alias refers to unknown target: {name}")
+        active.add(name)
+        try:
+            return visit_operation(operation)
+        finally:
+            active.remove(name)
+
+    def visit_operation(operation: DeltaOp) -> tuple[DeltaOp, ...]:
+        if isinstance(operation, Alias):
+            return visit_target(operation.target)
+        if isinstance(operation, Sum):
+            return tuple(term for child in operation.terms for term in visit_operation(child))
+        return (operation,)
+
+    return visit_target(target)
+
+
+def sparse_indices_by_target(
+    program: DeltaProgram, tensors: TensorMap
+) -> dict[str, tuple[int, ...]]:
+    """Return flattened sparse coordinates carried by each target.
+
+    Coordinates are evidence from the serialized sparse operations themselves;
+    dense values that merely happen to contain zeros are not treated as sparse.
+    """
+
+    result: dict[str, tuple[int, ...]] = {}
+    for target in sorted(program.targets):
+        coordinates: set[int] = set()
+        observed_sparse = False
+        for operation in _target_terms(program, target):
+            if not isinstance(operation, SparseMatrixDelta):
+                continue
+            observed_sparse = True
+            if operation.scale == 0.0:
+                continue
+            indices = tensors[operation.indices].detach().to(device="cpu", dtype=torch.int64)
+            values = tensors[operation.values].detach().to(device="cpu")
+            for (row, column), value in zip(indices.tolist(), values.tolist(), strict=True):
+                if float(value) == 0.0:
+                    continue
+                coordinates.add(int(row) * operation.shape[1] + int(column))
+        if observed_sparse:
+            result[target] = tuple(sorted(coordinates))
+    return result
+
+
+def low_rank_factors_by_target(
+    program: DeltaProgram, tensors: TensorMap
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Return concatenated ``B, A`` factors for each low-rank target component."""
+
+    result: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for target in sorted(program.targets):
+        left_factors: list[torch.Tensor] = []
+        right_factors: list[torch.Tensor] = []
+        for operation in _target_terms(program, target):
+            if not isinstance(operation, LowRankMatrixDelta) or operation.scale == 0.0:
+                continue
+            # Scaling either factor preserves the represented delta and its
+            # subspace; putting it on B also handles negative scales directly.
+            left_factors.append(tensors[operation.left].detach() * operation.scale)
+            right_factors.append(tensors[operation.right].detach())
+        if left_factors:
+            result[target] = (
+                torch.cat(left_factors, dim=1),
+                torch.cat(right_factors, dim=0),
+            )
+    return result
 
 
 def module_overlap(left: Sequence[str], right: Sequence[str]) -> SetOverlap:

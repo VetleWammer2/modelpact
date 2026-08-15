@@ -19,8 +19,10 @@ from modelpact.compose.contradiction import (
 )
 from modelpact.compose.interactions import (
     contract_margin_interaction,
+    low_rank_factors_by_target,
     low_rank_subspace_diagnostics,
     module_overlap,
+    sparse_indices_by_target,
 )
 from modelpact.compose.merge import (
     JointCompilationResult,
@@ -34,6 +36,12 @@ from modelpact.compose.stack import (
     StackResolutionKind,
     dependency_order,
     resolve_stack,
+)
+from modelpact.patch.ast import (
+    DeltaProgram,
+    LowRankMatrixDelta,
+    SparseMatrixDelta,
+    Sum,
 )
 from modelpact.status import CompositionClaim, VerificationOutcome
 
@@ -139,6 +147,53 @@ def test_passing_margin_degradation_is_not_reported_as_closed() -> None:
     assert result.degraded_contracts == ("a",)
 
 
+def test_executed_baselines_find_positive_pair_degradation_and_interaction() -> None:
+    left = _patch("left", 1.0, "left-contract", margins={})
+    right = _patch("right", 2.0, "right-contract", margins={})
+    executed_values: list[float] = []
+
+    def execute(
+        delta: dict[str, torch.Tensor] | object, _contracts: tuple[str, ...]
+    ) -> VerificationReport:
+        assert isinstance(delta, dict)
+        value = float(delta.get("weight", torch.tensor([0.0])).item())
+        executed_values.append(value)
+        margins_by_value = {
+            0.0: (0.1, 0.2),
+            1.0: (0.8, -0.3),
+            2.0: (-0.4, 0.7),
+            3.0: (0.2, 0.25),
+        }
+        left_margin, right_margin = margins_by_value[value]
+        margins = (
+            ContractMargin("left-contract", MarginKind.TARGET, left_margin),
+            ContractMargin("right-contract", MarginKind.TARGET, right_margin),
+        )
+        outcome = (
+            VerificationOutcome.PASS
+            if all(margin.passed for margin in margins)
+            else VerificationOutcome.FAIL
+        )
+        return VerificationReport(outcome, margins)
+
+    result = verify_contract_closure(
+        [right, left],
+        executor=execute,
+        degradation_tolerance=0.5,
+        execute_baselines=True,
+    )
+
+    assert executed_values == [0.0, 1.0, 2.0, 3.0]
+    assert result.claim is CompositionClaim.COMPOSITION_DEGRADED
+    assert result.degraded_contracts == ("left-contract",)
+    assert result.base_verification is not None
+    assert tuple(result.singleton_verifications) == ("left", "right")
+    assert result.interaction_margins == pytest.approx(
+        {"left-contract": -0.1, "right-contract": 0.05}
+    )
+    assert not result.evidence_gaps
+
+
 def test_static_checker_is_conservative_and_returns_minimal_witnesses() -> None:
     contradictions = find_static_contradictions(
         [
@@ -167,6 +222,36 @@ def test_subspace_diagnostics_report_orthogonal_and_shared_spaces() -> None:
     assert diagnostics.column_space.radians[0] == math.pi / 2
     assert diagnostics.row_space.radians[0] == 0.0
     assert module_overlap(["a", "b"], ["b", "c"]).jaccard == 1 / 3
+
+
+def test_serialized_factor_and_sparse_evidence_is_extracted_without_densifying() -> None:
+    program = DeltaProgram(
+        {
+            "weight": Sum(
+                (
+                    LowRankMatrixDelta("b1", "a1", 2.0),
+                    LowRankMatrixDelta("b2", "a2", -1.0),
+                    SparseMatrixDelta("indices", "values", (2, 3)),
+                )
+            )
+        }
+    )
+    tensors = {
+        "a1": torch.tensor([[1.0, 0.0, 0.0]]),
+        "a2": torch.tensor([[0.0, 1.0, 0.0]]),
+        "b1": torch.tensor([[1.0], [0.0]]),
+        "b2": torch.tensor([[0.0], [1.0]]),
+        "indices": torch.tensor([[0, 2], [1, 1]], dtype=torch.int64),
+        "values": torch.tensor([0.5, -0.5]),
+    }
+
+    factors = low_rank_factors_by_target(program, tensors)
+    assert torch.equal(factors["weight"][0], torch.tensor([[2.0, -0.0], [0.0, -1.0]]))
+    assert torch.equal(
+        factors["weight"][1],
+        torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+    )
+    assert sparse_indices_by_target(program, tensors) == {"weight": (2, 4)}
 
 
 def test_semantic_merge_invokes_joint_compiler_and_reverifies() -> None:
@@ -235,7 +320,7 @@ def test_semantic_merge_reports_budgeted_empirical_infeasibility_honestly() -> N
 def test_stack_resolution_is_identity_ordered_and_dependency_checked() -> None:
     base = "sha256:base"
     first = PatchReference("a", "ha", base, ("ca",), "aa")
-    second = PatchReference("b", "hb", base, ("cb",), "ab", requires=("a",))
+    second = PatchReference("b", "hb", base, ("cb",), "ab", requires=("ca",))
     assert dependency_order([second, first]) == ("a", "b")
 
     resolved = resolve_stack(

@@ -28,6 +28,7 @@ class MergeDisposition(StrEnum):
     EMPIRICALLY_INFEASIBLE_WITHIN_BUDGET = "EMPIRICALLY_INFEASIBLE_WITHIN_BUDGET"
     COMPILER_FAILED = "COMPILER_FAILED"
     RECOMPILED_CANDIDATE_FAILED_VERIFICATION = "RECOMPILED_CANDIDATE_FAILED_VERIFICATION"
+    FINAL_CANDIDATE_FAILED_HOLDOUT = "FINAL_CANDIDATE_FAILED_HOLDOUT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +108,7 @@ def semantic_merge(
     aliases: Mapping[str, str] | None = None,
     contradiction_checker: ContradictionChecker | None = None,
     force_recompile: bool = False,
+    execute_baselines: bool = False,
 ) -> SemanticMergeResult:
     """Verify addition, then jointly compile and independently verify if needed."""
 
@@ -116,6 +118,7 @@ def semantic_merge(
         executor=executor,
         aliases=aliases,
         contradiction_checker=contradiction_checker,
+        execute_baselines=execute_baselines,
     )
     if naive.claim is CompositionClaim.STATIC_CONTRACT_CONTRADICTION:
         return SemanticMergeResult(
