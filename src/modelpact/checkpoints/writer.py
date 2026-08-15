@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import sys
@@ -37,8 +36,6 @@ DEFAULT_MAX_SHARD_SIZE = 2 * 1024**3
 MAX_AUXILIARY_FILE_BYTES = 1024**3
 MAX_SOURCE_FILES = 10_000
 MAX_SOURCE_AGGREGATE_BYTES = 64 * 1024**3
-MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024**2
-
 _SAFETENSORS_DTYPE_INFO: dict[str, tuple[str, int]] = {
     "BF16": ("bfloat16", 2),
     "BOOL": ("bool", 1),
@@ -76,52 +73,6 @@ class _IOMeasurements:
     read_seconds: float = 0.0
     write_bytes: int = 0
     write_seconds: float = 0.0
-
-
-def _canonicalize_safetensors_header(path: Path) -> None:
-    """Sort a freshly written SafeTensors header without moving tensor bytes.
-
-    ``safetensors`` accepts metadata as a mapping but its native serializer does
-    not promise stable iteration order for multiple metadata keys.  Preserve the
-    allocated header length and canonicalize the generated JSON in place so the
-    checkpoint remains byte deterministic.
-    """
-
-    file_size = path.stat().st_size
-    with path.open("r+b") as handle:
-        prefix = handle.read(8)
-        if len(prefix) != 8:
-            raise RuntimeError("freshly written SafeTensors file lacks a complete header")
-        header_size = int.from_bytes(prefix, byteorder="little", signed=False)
-        if (
-            header_size <= 0
-            or header_size > MAX_SAFETENSORS_HEADER_BYTES
-            or header_size > file_size - 8
-        ):
-            raise RuntimeError("freshly written SafeTensors file has an invalid header size")
-        encoded_header = handle.read(header_size)
-        try:
-            header = json.loads(encoded_header.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise RuntimeError(
-                "freshly written SafeTensors file has invalid header JSON"
-            ) from error
-        if not isinstance(header, dict):
-            raise RuntimeError("freshly written SafeTensors header must be an object")
-        canonical = json.dumps(
-            header,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        if len(canonical) > header_size:
-            raise RuntimeError("canonical SafeTensors header exceeds its allocated size")
-        handle.seek(8)
-        handle.write(canonical)
-        handle.write(b" " * (header_size - len(canonical)))
-        handle.flush()
-        os.fsync(handle.fileno())
 
 
 def _source_file_hashes(source: Path) -> dict[str, str]:
@@ -491,7 +442,6 @@ def materialize_checkpoint(
                 },
                 overwrite=False,
             )
-            _canonicalize_safetensors_header(temporary / filename)
             measurements.write_seconds += time.perf_counter() - write_started
             measurements.write_bytes += (temporary / filename).stat().st_size
             output_files.append(filename)

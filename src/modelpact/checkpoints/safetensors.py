@@ -12,11 +12,13 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import Tensor
 
+from modelpact.util.canonical_json import canonical_json_bytes, strict_json_loads
 from modelpact.util.hashing import sha256_bytes
 
 DEFAULT_MAX_FILE_BYTES = 16 * 1024**3
 DEFAULT_MAX_TENSORS = 100_000
 DEFAULT_MAX_TENSOR_ELEMENTS = 1 << 40
+MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024**2
 
 
 def _plain_file(path: Path, *, max_file_bytes: int) -> None:
@@ -84,6 +86,45 @@ def _normalized_tensors(tensors: Mapping[str, Tensor]) -> dict[str, Tensor]:
     return normalized
 
 
+def _canonicalize_safetensors_header(path: Path) -> None:
+    """Canonicalize a freshly written SafeTensors header in place.
+
+    The SafeTensors serializer does not promise deterministic map iteration for
+    metadata. Preserve its allocated header length and tensor payload offsets,
+    but replace the generated JSON with ModelPact's canonical encoding.
+    """
+
+    file_size = path.stat().st_size
+    with path.open("r+b") as handle:
+        prefix = handle.read(8)
+        if len(prefix) != 8:
+            raise RuntimeError("freshly written SafeTensors file lacks a complete header")
+        header_size = int.from_bytes(prefix, byteorder="little", signed=False)
+        if (
+            header_size <= 0
+            or header_size > MAX_SAFETENSORS_HEADER_BYTES
+            or header_size > file_size - 8
+        ):
+            raise RuntimeError("freshly written SafeTensors file has an invalid header size")
+        encoded_header = handle.read(header_size)
+        try:
+            header = strict_json_loads(encoded_header)
+        except ValueError as error:
+            raise RuntimeError(
+                "freshly written SafeTensors file has invalid header JSON"
+            ) from error
+        if not isinstance(header, dict):
+            raise RuntimeError("freshly written SafeTensors header must be an object")
+        canonical = canonical_json_bytes(header)
+        if len(canonical) > header_size:
+            raise RuntimeError("canonical SafeTensors header exceeds its allocated size")
+        handle.seek(8)
+        handle.write(canonical)
+        handle.write(b" " * (header_size - len(canonical)))
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def save_safetensors_atomic(
     path: str | Path,
     tensors: Mapping[str, Tensor],
@@ -110,6 +151,7 @@ def save_safetensors_atomic(
             temporary,
             metadata=dict(sorted((metadata or {}).items())),
         )
+        _canonicalize_safetensors_header(temporary)
         if not overwrite and target.exists():
             raise FileExistsError(target)
         os.replace(temporary, target)
