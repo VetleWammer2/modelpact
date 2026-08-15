@@ -58,6 +58,9 @@ def _validate_forkbench_artifacts(root: Path, fork: dict[str, Any]) -> None:
     validate_certificate(certificate, artifact_root=patch_root)
     if certificate.patch_id != bundle.manifest.patch_id:
         raise ValueError("ForkBench certificate patch identity mismatch")
+    declared_contracts = set(bundle.manifest.provides) | set(bundle.manifest.preserves)
+    if set(certificate.contract_hashes.values()) != declared_contracts:
+        raise ValueError("ForkBench certificate does not bind every declared patch contract")
     standalone = _load(root, "forkbench_standalone_verify.json")
     result_hash = standalone.get("result_hash")
     unhashed = {key: value for key, value in standalone.items() if key != "result_hash"}

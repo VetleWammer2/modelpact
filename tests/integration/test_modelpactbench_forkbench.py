@@ -133,6 +133,9 @@ def test_forkbench_executes_selective_extraction_and_emits_evidence(tmp_path: Pa
     certificate = read_certificate(patch_root / "certificate.json")
     validate_certificate(certificate, artifact_root=patch_root)
     assert certificate.patch_id == bundle.manifest.patch_id
+    assert set(certificate.contract_hashes.values()) == (
+        set(bundle.manifest.provides) | set(bundle.manifest.preserves)
+    )
     assert "SEALED_HOLDOUT_VERIFIED" in certificate.claims
     assert "FREE_GENERATION_VERIFIED" in certificate.claims
     assert result["negative_findings"]

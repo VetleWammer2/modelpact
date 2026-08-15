@@ -39,7 +39,7 @@ witness clusters; four of five witnesses were delta-debug minimized.
 The selected fact cluster produced a patch with:
 
 - two active modules (`layers.0.mlp.down_proj` and tied `lm_head`), rank one each;
-- 1,292 factor-tensor payload bytes and a 597,502-byte complete evidence bundle;
+- 1,292 factor-tensor payload bytes and a 597,601-byte complete evidence bundle;
 - three compile attempts and three executed minimization candidates;
 - `MODULE_ONE_MINIMAL` and `RANK_LOCAL_MINIMUM` within that executed budget;
 - 24 free-generation records;
@@ -178,16 +178,16 @@ Raw result: [`huggingface_local.json`](artifacts/huggingface_local.json).
 
 | Stage | Wall time | Other executed quantity |
 | --- | ---: | --- |
-| ForkBench total | 18.07 s | 200 base + 150 target training steps |
-| ForkBench training | 2.64 s | six setup behaviors checked |
-| ForkBench diff | 0.06 s | 6 prompts, 49 tokens, 5 witnesses |
-| ForkBench extraction | 14.12 s | 3 attempts, bounded CEGIS |
-| ForkBench minimization | 0.10 s | 3 candidates |
+| ForkBench total | 33.64 s | 200 base + 150 target training steps |
+| ForkBench training | 4.49 s | six setup behaviors checked |
+| ForkBench diff | 0.11 s | 6 prompts, 49 tokens, 5 witnesses |
+| ForkBench extraction | 26.70 s | 3 attempts, bounded CEGIS |
+| ForkBench minimization | 0.24 s | 3 candidates |
 | Closure Matrix | 1.17 s | empty stack + all 63 nonempty TinyCausalLM subsets |
 | Benign Collusion | 19.83 s | 40 active subsets plus exact ground truth and baselines |
 | Hugging Face total | 17.39 s | four locally trained checkpoints |
 | Hugging Face compilation | 3.69 s | 360 total compiler steps |
-| Streaming materialization | 0.036 s before manifest | 79,129 bytes read; 48,559 bytes written; 6 output shards |
+| Streaming materialization | 0.046 s before manifest | 79,129 bytes read; 48,559 bytes written; 6 output shards |
 
 These are single observations on the environment above. No GPU memory, peak-RSS
 comparison, throughput scaling, or statistical timing interval is claimed.

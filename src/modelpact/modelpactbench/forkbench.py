@@ -1193,6 +1193,10 @@ def _run_forkbench_at(root: Path, config: ForkBenchConfig) -> dict[str, object]:
         minimization_result=minimization_evidence,
         objectives_optimized=True,
         minimized_within_budget=True,
+        contract_hashes={
+            contract.id: contract.contract_id,
+            preservation.id: preservation.contract_id,
+        },
         additional_warnings=(
             "Verified under finite ForkBench probes and bounded deterministic search only.",
         ),

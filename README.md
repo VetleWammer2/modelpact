@@ -291,10 +291,10 @@ seed is integration evidence, not a statistical superiority claim.
 | Hugging Face local | 2 patches, closed composition, direct verified rebase, 2/2 package-independent verifiers PASS | Generated local 1-layer GPT-NeoX, one seed |
 | Locality/CEGIS | search failures increased 3 to 4 | Negative polynomial-organism result |
 
-On the recorded 12-logical-CPU Windows host, ForkBench took 18.07 s (14.12 s
+On the recorded 12-logical-CPU Windows host, ForkBench took 33.64 s (26.70 s
 extraction); the Hugging Face workflow took 17.39 s (3.69 s compiling 360 total
 steps). The committed streaming materialization read 79,129 bytes, wrote 48,559
-bytes, and took 0.036 s before its manifest; peak RSS was unavailable on this
+bytes, and took 0.046 s before its manifest; peak RSS was unavailable on this
 Windows host. These timings are local observations, not cross-platform
 performance claims. See [`research/RESULTS.md`](research/RESULTS.md) and the raw
 JSON.
