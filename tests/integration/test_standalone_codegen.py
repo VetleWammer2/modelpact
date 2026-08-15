@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import py_compile
 import re
 import shutil
 import subprocess
@@ -16,10 +17,12 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from modelpact.codegen import emit_apply_script, emit_verify_script
+from modelpact.contracts.parser import parse_contract
 from modelpact.models.aliases import AliasGroup
 from modelpact.models.fingerprint import (
     chat_template_fingerprint,
     checkpoint_tensor_fingerprint,
+    configuration_fingerprint,
     generation_config_fingerprint,
     tokenizer_fingerprint,
 )
@@ -129,6 +132,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path]:
     save_file(state, base / "model.safetensors")
     (base / "config.json").write_text('{"fixture":true}', encoding="utf-8")
     (base / "tokenizer.json").write_text('{"fixture":true}', encoding="utf-8")
+    (base / "tokenizer_config.json").write_text(
+        '{"chat_template":"fixture-template"}', encoding="utf-8"
+    )
+    (base / "generation_config.json").write_text('{"max_new_tokens":8}', encoding="utf-8")
     (base / "modeling.py").write_text("raise RuntimeError('must not be copied')", encoding="utf-8")
     checkpoint_hash, _ = checkpoint_tensor_fingerprint(base)
     tensor_specs = tuple(
@@ -200,8 +207,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path]:
         },
         "generation": {"mode": "greedy", "max_new_tokens": 8, "seeds": [5]},
     }
+    parsed_contract = parse_contract(contract)
+    contract_bytes = json.dumps(contract, sort_keys=True).encode()
     contracts = {
-        "contracts/behavior.json": json.dumps(contract, sort_keys=True).encode(),
+        "contracts/target.yaml": contract_bytes,
         "contracts/probes/targets.jsonl": b'{"id":"t","prompt":"target","expected":"ok"}\n',
         "contracts/probes/guards.jsonl": b'{"id":"g","prompt":"guard","expected":" stable "}\n',
     }
@@ -213,6 +222,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path]:
             "architecture_hash": hash_canonical({"fixture": "architecture"}),
             "chat_template_hash": chat_template_fingerprint(base),
             "checkpoint_hash": checkpoint_hash,
+            "configuration_hash": configuration_fingerprint(base),
             "generation_config_hash": generation_config_fingerprint(base),
             "schema_version": 1,
             "state_schema_hash": schema.schema_hash,
@@ -223,8 +233,9 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path]:
         tensors=tensors,
         tool_version="0.1.0",
         contracts=contracts,
-        provides=("standalone-codegen",),
-        preserves=("stable-control",),
+        supplemental_artifacts={"evidence/compile.json": b'{"schema_version":1}'},
+        provides=(parsed_contract.contract_id,),
+        preserves=(parsed_contract.contract_id,),
     )
     return base, bundle.path
 
@@ -234,6 +245,7 @@ def test_standalone_apply_isolated_and_detects_tampering(tmp_path: Path) -> None
     script = emit_apply_script(bundle, tmp_path / "apply_patch.py")
     source = script.read_text(encoding="utf-8")
     assert re.search(r"^\s*(?:from|import)\s+modelpact\b", source, re.MULTILINE) is None
+    assert str(tmp_path.resolve()) not in source
     environment = _isolated_environment(tmp_path)
     preflight = subprocess.run(  # noqa: S603 - exact interpreter and constant code
         [
@@ -283,6 +295,27 @@ def test_standalone_apply_isolated_and_detects_tampering(tmp_path: Path) -> None
     assert _result(process)["outcome"] == "FAIL"
     assert not (tmp_path / "tampered-output").exists()
 
+    rebound = tmp_path / "rebound-evidence-patch"
+    shutil.copytree(bundle, rebound)
+    evidence_path = rebound / "evidence" / "compile.json"
+    evidence_path.write_bytes(b'{"schema_version":1,"tampered":true}')
+    manifest_path = rebound / "manifest.json"
+    rebound_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    rebound_manifest["artifact_hashes"]["evidence/compile.json"] = sha256_file(evidence_path)
+    manifest_path.write_text(json.dumps(rebound_manifest, sort_keys=True), encoding="utf-8")
+    process = _run(
+        script,
+        "--patch",
+        rebound,
+        base,
+        tmp_path / "rebound-output",
+        cwd=tmp_path,
+        environment=environment,
+    )
+    assert process.returncode != 0
+    assert "evidence identity" in str(_result(process)["error"])
+    assert not (tmp_path / "rebound-output").exists()
+
     traversal = tmp_path / "traversal-patch"
     shutil.copytree(bundle, traversal)
     manifest_path = traversal / "manifest.json"
@@ -327,12 +360,36 @@ def test_standalone_apply_isolated_and_detects_tampering(tmp_path: Path) -> None
     assert "fingerprint mismatch" in str(_result(process)["error"])
     assert not (tmp_path / "wrong-output").exists()
 
+    identity_mutations = {
+        "config.json": b'{"fixture":false}',
+        "tokenizer.json": b'{"fixture":false}',
+        "tokenizer_config.json": b'{"chat_template":"changed"}',
+        "generation_config.json": b'{"max_new_tokens":9}',
+    }
+    for index, (name, content) in enumerate(sorted(identity_mutations.items())):
+        changed = tmp_path / f"identity-{index}"
+        shutil.copytree(base, changed)
+        (changed / name).write_bytes(content)
+        changed_output = tmp_path / f"identity-output-{index}"
+        process = _run(
+            script,
+            changed,
+            changed_output,
+            cwd=tmp_path,
+            environment=environment,
+        )
+        assert process.returncode != 0
+        assert "identity mismatch" in str(_result(process)["error"])
+        assert not changed_output.exists()
+
 
 def test_standalone_verify_reexecutes_contracts_without_package(tmp_path: Path) -> None:
     base, bundle = _fixture(tmp_path)
     _write_adapter(tmp_path / "fixture_adapter.py")
     script = emit_verify_script(bundle, tmp_path / "verify_patch.py")
-    assert "import modelpact" not in script.read_text(encoding="utf-8")
+    source = script.read_text(encoding="utf-8")
+    assert "import modelpact" not in source
+    assert str(tmp_path.resolve()) not in source
     environment = _isolated_environment(tmp_path)
     report = tmp_path / "verification.json"
     process = _run(
@@ -369,3 +426,51 @@ def test_standalone_verify_reexecutes_contracts_without_package(tmp_path: Path) 
     )
     assert process.returncode != 0
     assert "artifact hash mismatch" in str(_result(process)["error"])
+
+    bundle_script = emit_verify_script(bundle, bundle / "independent_verify.py")
+    execution_marker = tmp_path / "bundle-adapter-executed"
+    (bundle / "bundle_adapter.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(execution_marker)!r}).write_text('executed', encoding='utf-8')\n"
+        "class Adapter:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    process = _run(
+        bundle_script,
+        base,
+        "--adapter",
+        "bundle_adapter:Adapter",
+        cwd=bundle,
+        environment=environment,
+    )
+    assert process.returncode != 0
+    assert "outside the untrusted patch bundle" in str(_result(process)["error"])
+    assert not execution_marker.exists()
+
+    bytecode_source = bundle / "bytecode_adapter.py"
+    bytecode_marker = tmp_path / "bytecode-adapter-executed"
+    bytecode_source.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(bytecode_marker)!r}).write_text('executed', encoding='utf-8')\n"
+        "class Adapter:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    py_compile.compile(
+        str(bytecode_source),
+        cfile=str(bundle / "bytecode_adapter.pyc"),
+        doraise=True,
+    )
+    bytecode_source.unlink()
+    process = _run(
+        bundle_script,
+        base,
+        "--adapter",
+        "bytecode_adapter:Adapter",
+        cwd=bundle,
+        environment=environment,
+    )
+    assert process.returncode != 0
+    assert "outside the untrusted patch bundle" in str(_result(process)["error"])
+    assert not bytecode_marker.exists()

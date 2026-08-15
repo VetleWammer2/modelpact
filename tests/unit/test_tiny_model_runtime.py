@@ -127,7 +127,13 @@ def test_model_manifest_is_stable_and_covers_tokenizer(tmp_path: Path) -> None:
         adapter_id=TinyModelAdapter.adapter_id,
         architecture_config=model.config.to_dict(),
     )
+    rescanned = build_model_manifest(
+        model,
+        checkpoint=checkpoint,
+        adapter_id=TinyModelAdapter.adapter_id,
+    )
     assert first.manifest_hash == second.manifest_hash
+    assert first.signature.architecture_hash == rescanned.signature.architecture_hash
     assert ModelManifest.from_dict(first.to_dict()) == first
     tokenizer_path = checkpoint / "tokenizer.json"
     tokenizer_value = json.loads(tokenizer_path.read_text(encoding="utf-8"))

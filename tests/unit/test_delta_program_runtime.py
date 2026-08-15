@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from modelpact.adapters.tiny_lm import TinyCausalLM, TinyConfig
+from modelpact.contracts.parser import parse_contract
 from modelpact.models.schema import inspect_state_schema
 from modelpact.patch.ast import (
     Alias,
@@ -22,6 +23,7 @@ from modelpact.patch.bundle import (
     missing_bundle_artifacts,
 )
 from modelpact.patch.validate import validate_base_signature
+from modelpact.util.canonical_json import canonical_dumps
 from modelpact.util.hashing import hash_canonical
 
 
@@ -177,6 +179,7 @@ def test_evidence_can_be_attached_without_changing_patch_identity(tmp_path: Path
         tool_version="0.1.0",
     )
     patch_id = bundle.manifest.patch_id
+    evidence_id = bundle.evidence_id
     attached = attach_bundle_artifacts(
         bundle.path,
         {
@@ -187,6 +190,8 @@ def test_evidence_can_be_attached_without_changing_patch_identity(tmp_path: Path
         state_schema=schema,
     )
     assert attached.manifest.patch_id == patch_id
+    assert attached.evidence_id != evidence_id
+    assert attached.bundle_id != bundle.bundle_id
     assert "evidence/compile.json" in attached.manifest.artifact_hashes
     assert "evidence/validation.json" in missing_bundle_artifacts(attached.manifest)
 
@@ -214,6 +219,33 @@ def test_contract_content_changes_patch_identity(tmp_path: Path) -> None:
     program = DeltaProgram({"layers.0.mlp.down_proj.weight": LowRankMatrixDelta("left", "right")})
     patch_ids = []
     for index, threshold in enumerate((0.1, 0.2)):
+        contract = parse_contract(
+            {
+                "compile": {"objectives": []},
+                "contract_version": 1,
+                "generation": {"max_new_tokens": 1, "mode": "greedy", "seeds": [0]},
+                "holdout": {"sealed": True, "unseal_policy": "final_candidate_only"},
+                "id": "contract-identity",
+                "model_requirements": {"output_semantics": "causal_lm"},
+                "schema_version": 1,
+                "statistics": {
+                    "bootstrap_samples": 10,
+                    "bootstrap_seed": 1,
+                    "confidence_level": 0.95,
+                },
+                "verify": {
+                    "guards": [],
+                    "targets": [
+                        {
+                            "id": "bounded-drift",
+                            "maximum_mean": threshold,
+                            "source": "probes.jsonl",
+                            "type": "base_kl",
+                        }
+                    ],
+                },
+            }
+        )
         bundle = create_patch_bundle(
             tmp_path / f"patch-{index}",
             name="contract-identity",
@@ -222,7 +254,10 @@ def test_contract_content_changes_patch_identity(tmp_path: Path) -> None:
             program=program,
             tensors=tensors,
             tool_version="0.1.0",
-            contracts={"contracts/target.yaml": f"maximum_mean: {threshold}\n".encode()},
+            contracts={
+                "contracts/target.yaml": (canonical_dumps(contract.to_dict()) + "\n").encode()
+            },
+            provides=(contract.contract_id,),
         )
         patch_ids.append(bundle.manifest.patch_id)
     assert patch_ids[0] != patch_ids[1]

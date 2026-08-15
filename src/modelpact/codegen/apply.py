@@ -12,10 +12,17 @@ def emit_apply_script(
     output: str | Path,
     *,
     overwrite: bool = False,
+    will_live_in_bundle: bool = False,
 ) -> Path:
     """Write a package-independent, patch-ID-pinned application script."""
 
-    return emit_script("apply", patch_bundle, output, overwrite=overwrite)
+    return emit_script(
+        "apply",
+        patch_bundle,
+        output,
+        overwrite=overwrite,
+        will_live_in_bundle=will_live_in_bundle,
+    )
 
 
 generate_apply_script = emit_apply_script

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from safetensors import safe_open
 
 from modelpact.adapters.tiny_lm import (
     TinyCausalLM,
@@ -133,6 +134,12 @@ def test_materialization_preserves_source_and_loads_real_patch(tmp_path: Path) -
     assert before == after
     assert (output / "materialization-manifest.json").is_file()
     assert len(manifest["output_files"]) > 1
+    for tensor_file in sorted(output.glob("*.safetensors")):
+        with safe_open(tensor_file, framework="pt", device="cpu") as handle:  # type: ignore[no-untyped-call]
+            assert handle.metadata() == {
+                "format": "pt",
+                "modelpact_format": "modelpact-materialized-v1",
+            }
     loaded = TinyModelAdapter().load(str(output), device="cpu", dtype=torch.float32)
     target = "layers.0.mlp.down_proj.weight"
     expected = program.apply_to_state(model.state_dict(), tensors)[target]
@@ -153,12 +160,54 @@ def test_materialization_is_byte_deterministic(tmp_path: Path) -> None:
     model = tiny_model()
     source = save_tiny_checkpoint(model, tmp_path / "source")
     program, tensors = linear_patch()
+    sharded_source = tmp_path / "sharded-source"
+    materialize_patch(source, sharded_source, program, tensors, max_shard_size=5_000)
+    source_before = {
+        path.name: sha256_file(path) for path in sharded_source.iterdir() if path.is_file()
+    }
     first, second = tmp_path / "first", tmp_path / "second"
+    manifests = []
     for output in (first, second):
-        materialize_patch(source, output, program, tensors, max_shard_size=5_000)
-    first_hashes = {path.name: sha256_file(path) for path in first.iterdir() if path.is_file()}
-    second_hashes = {path.name: sha256_file(path) for path in second.iterdir() if path.is_file()}
+        manifests.append(
+            materialize_patch(
+                sharded_source,
+                output,
+                program,
+                tensors,
+                max_shard_size=5_000,
+            )
+        )
+    source_after = {
+        path.name: sha256_file(path) for path in sharded_source.iterdir() if path.is_file()
+    }
+    assert source_before == source_after
+    first_hashes = {
+        path.name: sha256_file(path)
+        for path in first.iterdir()
+        if path.is_file() and path.name != "materialization-manifest.json"
+    }
+    second_hashes = {
+        path.name: sha256_file(path)
+        for path in second.iterdir()
+        if path.is_file() and path.name != "materialization-manifest.json"
+    }
     assert first_hashes == second_hashes
+    first_stable = {key: value for key, value in manifests[0].items() if key != "performance"}
+    second_stable = {key: value for key, value in manifests[1].items() if key != "performance"}
+    assert first_stable == second_stable
+    assert len([name for name in manifests[0]["output_files"] if name.endswith(".safetensors")]) > 1
+    for manifest in manifests:
+        performance = manifest["performance"]
+        assert performance["streaming_strategy"] == "planned-output-shard"
+        assert performance["read_bytes"] > 0
+        assert performance["write_bytes"] > 0
+        assert performance["read_seconds"] >= 0
+        assert performance["write_seconds"] >= 0
+        peak_rss = performance["peak_rss_bytes"]
+        if peak_rss is None:
+            assert performance["peak_rss_method"] == "unavailable"
+        else:
+            assert isinstance(peak_rss, int) and peak_rss > 0
 
 
 def test_materialization_expands_physically_omitted_tied_key(tmp_path: Path) -> None:
@@ -186,3 +235,33 @@ def test_materialization_expands_physically_omitted_tied_key(tmp_path: Path) -> 
     )
     loaded = TinyModelAdapter().load(str(output), device="cpu", dtype=torch.float32)
     assert loaded.lm_head.weight is loaded.token_embedding.weight
+
+
+def test_materialization_failure_leaves_source_and_output_atomic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = tiny_model()
+    source = save_tiny_checkpoint(model, tmp_path / "source")
+    before = {path.name: sha256_file(path) for path in source.iterdir() if path.is_file()}
+    program, tensors = linear_patch()
+    output = tmp_path / "materialized"
+    real_save = save_safetensors_atomic
+    calls = 0
+
+    def fail_on_second_shard(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected shard write failure")
+        real_save(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        "modelpact.checkpoints.writer.save_safetensors_atomic", fail_on_second_shard
+    )
+    with pytest.raises(RuntimeError, match="injected shard write failure"):
+        materialize_patch(source, output, program, tensors, max_shard_size=5_000)
+
+    after = {path.name: sha256_file(path) for path in source.iterdir() if path.is_file()}
+    assert before == after
+    assert not output.exists()
+    assert not list(tmp_path.glob(".materialized.*"))

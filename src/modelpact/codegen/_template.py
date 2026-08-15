@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
+import importlib.util
 import json
 import math
 import os
@@ -36,10 +37,23 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+@@BUILTIN_TINY_ADAPTER@@
+@@BUILTIN_HUGGINGFACE_ADAPTER@@
 
 MODE = @@MODE@@
 EXPECTED_PATCH_ID = @@EXPECTED_PATCH_ID@@
-DEFAULT_PATCH = @@DEFAULT_PATCH@@
+EXPECTED_EVIDENCE_ID = @@EXPECTED_EVIDENCE_ID@@
+DEFAULT_PATCH_RELATIVE = @@DEFAULT_PATCH_RELATIVE@@
+DEFAULT_PATCH = (
+    None
+    if DEFAULT_PATCH_RELATIVE is None
+    else str(
+        (
+            Path(__file__).resolve().parent
+            / Path(*PurePosixPath(DEFAULT_PATCH_RELATIVE).parts)
+        ).resolve()
+    )
+)
 
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_CONTRACT_BYTES = 2 * 1024 * 1024
@@ -380,12 +394,19 @@ def _validate_manifest(value: object) -> dict[str, object]:
             "tokenizer_hash",
             "chat_template_hash",
             "generation_config_hash",
+            "configuration_hash",
         },
         "base signature",
     )
     checkpoint_hash = base.get("checkpoint_hash")
     if not isinstance(checkpoint_hash, str) or DIGEST_RE.fullmatch(checkpoint_hash) is None:
         raise ToolError("base_signature.checkpoint_hash is required")
+    configuration_hash = base.get("configuration_hash")
+    if configuration_hash is not None and (
+        not isinstance(configuration_hash, str)
+        or DIGEST_RE.fullmatch(configuration_hash) is None
+    ):
+        raise ToolError("base_signature.configuration_hash must be a SHA-256 digest")
     _mapping(manifest.get("compiler_configuration"), "compiler_configuration")
     artifacts = _mapping(manifest.get("artifact_hashes"), "artifact_hashes")
     if len(artifacts) > MAX_TENSORS:
@@ -408,6 +429,21 @@ def _validate_manifest(value: object) -> dict[str, object]:
         raise ToolError("patch identity does not match canonical manifest content")
     if manifest["patch_id"] != EXPECTED_PATCH_ID:
         raise ToolError("bundle patch ID differs from the ID pinned in this script")
+    evidence_id = _hash_canonical(
+        {
+            "artifact_hashes": {
+                path: digest
+                for path, digest in sorted(artifacts.items())
+                if path not in {"apply_patch.py", "verify_patch.py", "certificate.json"}
+            },
+            "patch_id": manifest["patch_id"],
+            "schema_version": 1,
+        }
+    )
+    if evidence_id != EXPECTED_EVIDENCE_ID:
+        raise ToolError(
+            "bundle evidence identity differs from the identity pinned in this script"
+        )
     return manifest
 
 
@@ -675,9 +711,11 @@ def _materialize(
     if output.exists() or output.is_symlink():
         raise ToolError("output already exists")
     state, base_hash, tensor_file, source_root = _checkpoint_tensors(base_checkpoint)
-    expected_base = _mapping(manifest["base_signature"], "base_signature")["checkpoint_hash"]
+    base_signature = _mapping(manifest["base_signature"], "base_signature")
+    expected_base = base_signature["checkpoint_hash"]
     if base_hash != expected_base:
         raise ToolError(f"base checkpoint fingerprint mismatch: expected {expected_base}, observed {base_hash}")
+    _assert_base_identity(base_checkpoint, base_signature, base_hash)
     source_resolved = base_checkpoint.resolve()
     output_resolved = output.parent.resolve() / output.name
     if output_resolved == source_resolved or (source_root is not None and _inside(source_root, output_resolved)):
@@ -691,7 +729,11 @@ def _materialize(
         save_file(
             {key: patched[key].detach().cpu().contiguous() for key in sorted(patched)},
             output_tensor,
-            metadata={"format": "modelpact-materialized-v1"},
+            # Transformers requires the reserved ``format`` metadata value to
+            # identify its framework. Keep ModelPact provenance in a separate
+            # data-only metadata field so the independently materialized
+            # checkpoint remains loadable by the reviewed local HF adapter.
+            metadata={"format": "pt", "modelpact_format": "modelpact-materialized-v1"},
         )
         copied: list[str] = []
         if source_root is not None:
@@ -919,6 +961,62 @@ def _tokenizer_hash(checkpoint: Path) -> str:
     return _hash_canonical({"files": records, "schema_version": 1})
 
 
+def _identity_json(checkpoint: Path, name: str, default: object) -> object:
+    _, root = _checkpoint_file(checkpoint)
+    if root is None:
+        return default
+    path = root / name
+    if not path.exists():
+        return default
+    if path.is_symlink() or not path.is_file():
+        raise ToolError(f"model identity input may not be a symlink: {name}")
+    if path.stat().st_size > MAX_AUXILIARY_BYTES:
+        raise ToolError(f"model identity input exceeds size limit: {name}")
+    return _loads_json(path.read_bytes(), maximum_bytes=MAX_AUXILIARY_BYTES)
+
+
+def _configuration_hash(checkpoint: Path) -> str:
+    value = _identity_json(checkpoint, "config.json", {})
+    configuration = _mapping(value, "model configuration")
+    excluded = {"_name_or_path", "transformers_version", "torch_dtype"}
+    canonical = {key: configuration[key] for key in sorted(configuration) if key not in excluded}
+    return _hash_canonical(canonical)
+
+
+def _chat_template_hash(checkpoint: Path) -> str:
+    value = _identity_json(checkpoint, "tokenizer_config.json", {})
+    configuration = _mapping(value, "tokenizer configuration")
+    return _hash_canonical({"chat_template": configuration.get("chat_template")})
+
+
+def _generation_config_hash(checkpoint: Path) -> str:
+    return _hash_canonical(_identity_json(checkpoint, "generation_config.json", {}))
+
+
+def _assert_base_identity(
+    checkpoint: Path,
+    base_signature: dict[str, object],
+    checkpoint_hash: str,
+) -> None:
+    observed = {
+        "checkpoint_hash": checkpoint_hash,
+        "tokenizer_hash": _tokenizer_hash(checkpoint),
+        "chat_template_hash": _chat_template_hash(checkpoint),
+        "generation_config_hash": _generation_config_hash(checkpoint),
+        "configuration_hash": _configuration_hash(checkpoint),
+    }
+    for name, actual in observed.items():
+        expected = base_signature.get(name)
+        if expected is None and name == "configuration_hash":
+            # Legacy bundles did not expose this independently recomputable
+            # component of architecture identity.
+            continue
+        if actual != expected:
+            raise ToolError(
+                f"base model identity mismatch for {name}: expected {expected}, observed {actual}"
+            )
+
+
 def _load_probe_rows(root: Path, relative: str, artifacts: dict[str, object]) -> list[dict[str, object]]:
     safe = _safe_relative(relative, "probe source")
     if safe not in artifacts:
@@ -945,7 +1043,7 @@ def _load_probe_rows(root: Path, relative: str, artifacts: dict[str, object]) ->
     return rows
 
 
-def _trusted_adapter(specification: str) -> object:
+def _trusted_adapter(specification: str, *, patch_root: Path) -> object:
     module_name, separator, attribute_name = specification.partition(":")
     identifier = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
     if (
@@ -954,16 +1052,61 @@ def _trusted_adapter(specification: str) -> object:
         or re.fullmatch(r"[A-Za-z_]\w*", attribute_name) is None
     ):
         raise ToolError("trusted adapter must be specified as module:attribute")
+    module_path = patch_root.joinpath(*module_name.split("."))
+    bundle_candidates = [module_path]
+    if module_path.parent.is_dir():
+        bundle_candidates.extend(module_path.parent.glob(module_path.name + ".*"))
+    if any(candidate.exists() or candidate.is_symlink() for candidate in bundle_candidates):
+        raise ToolError("trusted adapter code must be located outside the untrusted patch bundle")
+    original_path = list(sys.path)
+    safe_path: list[str] = []
+    for item in original_path:
+        candidate = Path(item or os.getcwd())
+        if _inside(patch_root, candidate):
+            continue
+        safe_path.append(item)
     try:
+        sys.path[:] = safe_path
+        spec = importlib.util.find_spec(module_name)
+        if spec is None:
+            raise ModuleNotFoundError(module_name)
+        origins = []
+        if spec.origin not in {None, "built-in", "frozen"}:
+            origins.append(Path(spec.origin))
+        if spec.submodule_search_locations is not None:
+            origins.extend(Path(item) for item in spec.submodule_search_locations)
+        if any(_inside(patch_root, origin) for origin in origins):
+            raise ToolError("trusted adapter code must be located outside the untrusted patch bundle")
         module = importlib.import_module(module_name)
         candidate = getattr(module, attribute_name)
         adapter = candidate() if isinstance(candidate, type) else candidate
+    except ToolError:
+        raise
     except Exception as error:
         raise InconclusiveError(f"trusted adapter could not be loaded: {type(error).__name__}: {error}") from error
+    finally:
+        sys.path[:] = original_path
     for name in ("load", "tokenizer", "generate", "forward_logits"):
         if not callable(getattr(adapter, name, None)):
             raise ToolError(f"trusted adapter does not implement required method: {name}")
     return adapter
+
+
+def _selected_adapter(
+    adapter_specification: str | None,
+    adapter_kind: str | None,
+    *,
+    patch_root: Path,
+) -> object:
+    if adapter_kind == "tiny":
+        return TinyModelAdapter()
+    if adapter_kind == "huggingface":
+        return StandaloneHuggingFaceModelAdapter()
+    if adapter_kind is not None:
+        raise UnsupportedError(f"unsupported built-in adapter kind: {adapter_kind}")
+    if adapter_specification is None:
+        raise ToolError("verification requires a built-in adapter kind or trusted local adapter")
+    return _trusted_adapter(adapter_specification, patch_root=patch_root)
 
 
 def _row_value(row: dict[str, object], assertion: dict[str, object], name: str, default: object = None) -> object:
@@ -1467,7 +1610,21 @@ def _contract_paths(root: Path, artifacts: dict[str, object], requested: list[st
     else:
         paths = [
             item for item in sorted(artifacts)
-            if Path(item).parent.as_posix() == "contracts"
+            if (
+                (
+                    len(Path(item).parts) == 2
+                    and Path(item).parts[0] == "contracts"
+                    and (
+                        Path(item).stem in {"target", "preservation"}
+                        or Path(item).stem.startswith("contract-")
+                    )
+                )
+                or (
+                    len(Path(item).parts) == 4
+                    and Path(item).parts[:2] == ("contracts", "parents")
+                    and Path(item).name == "contract.json"
+                )
+            )
             and Path(item).suffix.lower() in {".yaml", ".yml", ".json"}
         ]
     if not paths:
@@ -1479,10 +1636,26 @@ def _contract_paths(root: Path, artifacts: dict[str, object], requested: list[st
     return sorted(set(paths))
 
 
+def _contract_resource_path(
+    contract_path: str,
+    relative: object,
+    artifacts: dict[str, object],
+) -> str:
+    resource = _safe_relative(relative, "contract resource")
+    # Retain compatibility with older bundles that explicitly used a
+    # bundle-root-relative resource path. New bundles use contract-relative
+    # paths, including contracts nested below contracts/parents/<hash>/.
+    if resource in artifacts:
+        return resource
+    candidate = (Path(contract_path).parent / resource).as_posix()
+    return _safe_relative(candidate, "contract-relative resource")
+
+
 def _verify(
     base_checkpoint: Path,
     patch_path: Path,
-    adapter_spec: str,
+    adapter_spec: str | None,
+    adapter_kind: str | None,
     requested_contracts: list[str],
     include_holdout: bool,
     dtype_name: str,
@@ -1490,9 +1663,11 @@ def _verify(
     root, manifest, program, patch_tensors = _load_bundle(patch_path)
     artifacts = _mapping(manifest["artifact_hashes"], "artifact_hashes")
     _, base_hash, _, _ = _checkpoint_tensors(base_checkpoint)
-    expected_base = _mapping(manifest["base_signature"], "base_signature")["checkpoint_hash"]
+    base_signature = _mapping(manifest["base_signature"], "base_signature")
+    expected_base = base_signature["checkpoint_hash"]
     if base_hash != expected_base:
         raise ToolError(f"base checkpoint fingerprint mismatch: expected {expected_base}, observed {base_hash}")
+    _assert_base_identity(base_checkpoint, base_signature, base_hash)
     dtype_map = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
@@ -1501,15 +1676,24 @@ def _verify(
     }
     if dtype_name not in dtype_map:
         raise ToolError("unsupported execution dtype")
-    adapter = _trusted_adapter(adapter_spec)
+    adapter = _selected_adapter(adapter_spec, adapter_kind, patch_root=root)
     expected_adapter = _mapping(manifest["base_signature"], "base_signature").get("adapter_id")
     observed_adapter = getattr(adapter, "adapter_id", None)
     if expected_adapter is not None and observed_adapter != expected_adapter:
         raise ToolError(f"adapter identity mismatch: expected {expected_adapter}, observed {observed_adapter}")
     contract_paths = _contract_paths(root, artifacts, requested_contracts)
-    contracts = [(path, _load_contract(_safe_file(root, path, maximum_bytes=MAX_CONTRACT_BYTES))) for path in contract_paths]
+    contracts: list[tuple[str, dict[str, object]]] = []
+    seen_contracts: set[str] = set()
+    for path in contract_paths:
+        contract = _load_contract(
+            _safe_file(root, path, maximum_bytes=MAX_CONTRACT_BYTES)
+        )
+        identity = _hash_canonical(contract)
+        if identity in seen_contracts:
+            continue
+        seen_contracts.add(identity)
+        contracts.append((path, contract))
     tokenizer_hash = _tokenizer_hash(base_checkpoint)
-    base_signature = _mapping(manifest["base_signature"], "base_signature")
     compatibility_errors: list[str] = []
     for path, contract in contracts:
         requirements = _mapping(contract.get("model_requirements", {}), "model_requirements")
@@ -1557,12 +1741,24 @@ def _verify(
                 guard_count += len(assertions) if group == "guards" else 0
                 for assertion_value in assertions:
                     assertion = _mapping(assertion_value, "assertion")
+                    execution_assertion = dict(assertion)
+                    execution_assertion["source"] = _contract_resource_path(
+                        path,
+                        assertion["source"],
+                        artifacts,
+                    )
+                    if "schema_file" in assertion:
+                        execution_assertion["schema_file"] = _contract_resource_path(
+                            path,
+                            assertion["schema_file"],
+                            artifacts,
+                        )
                     try:
                         result, generated = _assertion_result(
                             root,
                             artifacts,
-                            assertion,
-                            str(assertion["source"]),
+                            execution_assertion,
+                            str(execution_assertion["source"]),
                             adapter,
                             model,
                             base_model,
@@ -1596,13 +1792,26 @@ def _verify(
                     source_override = holdout.get(source_key)
                     if source_override is None:
                         continue
+                    scoped_source = _contract_resource_path(path, source_override, artifacts)
                     assertions = verify.get(group, [])
                     assert isinstance(assertions, list)
                     for assertion_value in assertions:
                         assertion = _mapping(assertion_value, "assertion")
+                        execution_assertion = dict(assertion)
+                        execution_assertion["source"] = _contract_resource_path(
+                            path,
+                            assertion["source"],
+                            artifacts,
+                        )
+                        if "schema_file" in assertion:
+                            execution_assertion["schema_file"] = _contract_resource_path(
+                                path,
+                                assertion["schema_file"],
+                                artifacts,
+                            )
                         try:
                             result, generated = _assertion_result(
-                                root, artifacts, assertion, str(source_override), adapter, model,
+                                root, artifacts, execution_assertion, scoped_source, adapter, model,
                                 base_model, generation, role,
                             )
                         except UnsupportedError as error:
@@ -1610,7 +1819,7 @@ def _verify(
                                 "assertion_id": f"{assertion['id']}@{role}", "assertion_type": assertion["type"],
                                 "margin": None, "message": str(error), "metric": assertion["type"],
                                 "outcome": "UNSUPPORTED", "prompt_metrics": [], "role": role,
-                                "source": source_override, "value": None,
+                                "source": scoped_source, "value": None,
                             }
                             generated = []
                         except (InconclusiveError, ToolError) as error:
@@ -1618,7 +1827,7 @@ def _verify(
                                 "assertion_id": f"{assertion['id']}@{role}", "assertion_type": assertion["type"],
                                 "margin": None, "message": str(error), "metric": assertion["type"],
                                 "outcome": "INCONCLUSIVE", "prompt_metrics": [], "role": role,
-                                "source": source_override, "value": None,
+                                "source": scoped_source, "value": None,
                             }
                             generated = []
                         else:
@@ -1652,8 +1861,11 @@ def _verify(
         "command": "verify",
         "contract_hashes": {path: artifacts[path] for path in contract_paths},
         "environment": {
+            "modelpact_importable": importlib.util.find_spec("modelpact") is not None,
             "platform": platform.platform(),
             "python": platform.python_version(),
+            "python_no_site": bool(sys.flags.no_site),
+            "python_safe_path": bool(sys.flags.safe_path),
             "safetensors": getattr(sys.modules.get("safetensors"), "__version__", "unknown"),
             "torch": torch.__version__,
         },
@@ -1703,7 +1915,16 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Independently verify a Behavior Patch Bundle v1")
     parser.add_argument("base", help="unsharded SafeTensors checkpoint file or directory")
     parser.add_argument("--patch", default=DEFAULT_PATCH, help="Patch Bundle v1 directory")
-    parser.add_argument("--adapter", required=True, help="trusted local adapter as module:attribute")
+    adapters = parser.add_mutually_exclusive_group(required=True)
+    adapters.add_argument(
+        "--adapter-kind",
+        choices=("tiny", "huggingface"),
+        help="reviewed adapter implementation embedded in this generated verifier",
+    )
+    adapters.add_argument(
+        "--adapter",
+        help="separately trusted local adapter as module:attribute; never loaded from the bundle",
+    )
     parser.add_argument("--contract", action="append", default=[], help="content-addressed bundle-relative contract")
     parser.add_argument("--include-holdout", action="store_true", help="execute declared sealed holdout probes")
     parser.add_argument("--dtype", default="float32", choices=("float16", "bfloat16", "float32", "float64"))
@@ -1725,6 +1946,7 @@ def main(argv: list[str] | None = None) -> int:
                 Path(args.base),
                 Path(args.patch),
                 args.adapter,
+                args.adapter_kind,
                 list(args.contract),
                 bool(args.include_holdout),
                 args.dtype,

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from torch import Tensor
 
 from modelpact.checkpoints.safetensors import load_safetensors
+from modelpact.util.canonical_json import strict_json_loads
 
 MAX_INDEX_BYTES = 16 * 1024**2
 
@@ -28,17 +28,21 @@ def _safe_child(root: Path, relative: str) -> Path:
 
 def checkpoint_files(checkpoint: str | Path) -> tuple[Path, ...]:
     source = Path(checkpoint)
+    if source.is_symlink():
+        raise ValueError("checkpoint input may not be a symlink")
     if source.is_file():
         if source.suffix != ".safetensors":
             raise ValueError("checkpoint file must use SafeTensors")
         return (source,)
-    if source.is_symlink() or not source.is_dir():
+    if not source.is_dir():
         raise ValueError(f"checkpoint directory does not exist: {source}")
     index = source / "model.safetensors.index.json"
     if index.exists():
+        if index.is_symlink() or not index.is_file():
+            raise ValueError("checkpoint index must be a regular file")
         if index.stat().st_size > MAX_INDEX_BYTES:
             raise ValueError("checkpoint index exceeds size limit")
-        value = json.loads(index.read_text(encoding="utf-8"))
+        value = strict_json_loads(index.read_bytes())
         weight_map = value.get("weight_map") if isinstance(value, dict) else None
         if not isinstance(weight_map, dict) or not weight_map:
             raise ValueError("malformed SafeTensors checkpoint index")

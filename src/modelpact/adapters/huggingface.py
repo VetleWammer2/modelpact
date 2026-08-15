@@ -7,11 +7,13 @@ inputs; Hugging Face checkpoint metadata remains untrusted data.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any, cast
 
 import torch
+from safetensors import safe_open
 from torch import Tensor, nn
 
 from modelpact.adapters.base import (
@@ -21,7 +23,98 @@ from modelpact.adapters.base import (
     ModelBatch,
     PatchableModule,
 )
+from modelpact.checkpoints.store import checkpoint_files
 from modelpact.models.schema import ModelStateSchema, inspect_state_schema
+from modelpact.util.canonical_json import strict_json_loads
+
+_MAX_CONFIG_BYTES = 16 * 1024**2
+_MAX_CHECKPOINT_FILES = 100_000
+_MAX_CHECKPOINT_SHARDS = 10_000
+_MAX_CHECKPOINT_TENSORS = 100_000
+_MAX_SHARD_BYTES = 16 * 1024**3
+_UNSAFE_WEIGHT_SUFFIXES = frozenset(
+    {".bin", ".ckpt", ".h5", ".msgpack", ".pickle", ".pkl", ".pt", ".pth"}
+)
+
+
+def _checkpoint_entries(root: Path) -> tuple[Path, ...]:
+    resolved_root = root.resolve()
+    pending = [root]
+    entries: list[Path] = []
+    while pending:
+        directory = pending.pop()
+        try:
+            children = tuple(directory.iterdir())
+        except OSError as error:
+            raise ValueError(
+                f"cannot inspect local Hugging Face checkpoint: {directory}"
+            ) from error
+        for child in children:
+            entries.append(child)
+            if len(entries) > _MAX_CHECKPOINT_FILES:
+                raise ValueError("Hugging Face checkpoint contains too many files")
+            if child.is_symlink():
+                raise ValueError("Hugging Face checkpoint may not contain symlinks")
+            resolved = child.resolve()
+            if resolved_root != resolved and resolved_root not in resolved.parents:
+                raise ValueError("Hugging Face checkpoint entry escapes its directory")
+            if child.is_dir():
+                pending.append(child)
+    return tuple(entries)
+
+
+def _validate_local_checkpoint(checkpoint: str) -> Path:
+    root = Path(checkpoint)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("Hugging Face checkpoint must be a local regular directory")
+    config_path = root / "config.json"
+    if config_path.is_symlink() or not config_path.is_file():
+        raise ValueError("local Hugging Face checkpoint requires a regular config.json")
+    if config_path.stat().st_size > _MAX_CONFIG_BYTES:
+        raise ValueError("Hugging Face configuration exceeds the size limit")
+    configuration = strict_json_loads(config_path.read_bytes(), max_depth=32)
+    if not isinstance(configuration, dict):
+        raise ValueError("Hugging Face configuration must be an object")
+
+    entries = _checkpoint_entries(root)
+    for entry in entries:
+        if not entry.is_file():
+            continue
+        lowered = entry.name.lower()
+        if entry.suffix.lower() in _UNSAFE_WEIGHT_SUFFIXES or lowered.endswith(
+            tuple(f"{suffix}.index.json" for suffix in _UNSAFE_WEIGHT_SUFFIXES)
+        ):
+            raise ValueError("Hugging Face checkpoint contains a non-SafeTensors weight file")
+
+    shards = checkpoint_files(root)
+    if len(shards) > _MAX_CHECKPOINT_SHARDS:
+        raise ValueError("Hugging Face checkpoint contains too many shards")
+    index = root / "model.safetensors.index.json"
+    if not index.exists() and (
+        len(shards) != 1 or shards[0].resolve() != (root / "model.safetensors").resolve()
+    ):
+        raise ValueError("unsharded Hugging Face checkpoint requires exactly one model.safetensors")
+    tensor_count = 0
+    for shard in shards:
+        if shard.suffix.lower() != ".safetensors" or not shard.is_file():
+            raise ValueError("checkpoint index must reference regular SafeTensors shards")
+        if shard.stat().st_size > _MAX_SHARD_BYTES:
+            raise ValueError("Hugging Face checkpoint shard exceeds the size limit")
+        try:
+            # SafeTensors does not currently publish callable typing for safe_open.
+            with safe_open(  # type: ignore[no-untyped-call]
+                shard, framework="pt", device="cpu"
+            ) as handle:
+                tensor_count += len(handle.keys())
+        except ValueError:
+            raise
+        except Exception as error:
+            raise ValueError(f"invalid SafeTensors checkpoint shard: {shard.name}") from error
+        if tensor_count > _MAX_CHECKPOINT_TENSORS:
+            raise ValueError("Hugging Face checkpoint contains too many tensors")
+    if tensor_count == 0:
+        raise ValueError("Hugging Face checkpoint contains no tensors")
+    return root
 
 
 class HuggingFaceTokenizerAdapter:
@@ -83,18 +176,14 @@ class HuggingFaceTokenizerAdapter:
 
 class HuggingFaceCausalLMAdapter:
     adapter_id = "modelpact.huggingface_causal_lm.local.v1"
+    supports_sampling_controls = True
 
     def __init__(self) -> None:
         self._tokenizer_adapter: HuggingFaceTokenizerAdapter | None = None
 
     @staticmethod
     def _local_directory(checkpoint: str) -> Path:
-        root = Path(checkpoint)
-        if root.is_symlink() or not root.is_dir():
-            raise ValueError("Hugging Face checkpoint must be a local regular directory")
-        if not (root / "config.json").is_file():
-            raise ValueError("local Hugging Face checkpoint has no config.json")
-        return root
+        return _validate_local_checkpoint(checkpoint)
 
     def load(
         self,
@@ -104,6 +193,9 @@ class HuggingFaceCausalLMAdapter:
         dtype: torch.dtype = torch.float32,
     ) -> nn.Module:
         root = self._local_directory(checkpoint)
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except ImportError as error:
@@ -180,9 +272,15 @@ class HuggingFaceCausalLMAdapter:
                     "max_new_tokens": policy.max_new_tokens,
                     "eos_token_id": tokenizer.eos_token_id if policy.stop_on_eos else None,
                     "pad_token_id": tokenizer.pad_token_id,
+                    "use_cache": False,
                 }
                 if policy.mode == "sample":
                     generation_arguments["temperature"] = policy.temperature
+                    generation_arguments["top_p"] = policy.top_p
+                    if policy.top_k is not None:
+                        generation_arguments["top_k"] = policy.top_k
+                if device.type == "cuda":
+                    torch.cuda.manual_seed_all(policy.seed)
                 output = generate(**generation_arguments)
         finally:
             model.train(prior_mode)

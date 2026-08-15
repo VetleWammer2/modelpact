@@ -14,13 +14,26 @@ def tensor_nbytes(tensor: Tensor) -> int:
 def plan_shards(
     tensors: Mapping[str, Tensor], *, max_shard_size: int
 ) -> tuple[tuple[str, ...], ...]:
+    return plan_shards_by_size(
+        {key: tensor_nbytes(value) for key, value in tensors.items()},
+        max_shard_size=max_shard_size,
+    )
+
+
+def plan_shards_by_size(
+    tensor_sizes: Mapping[str, int], *, max_shard_size: int
+) -> tuple[tuple[str, ...], ...]:
+    """Plan deterministic shards without materializing the tensors themselves."""
+
     if max_shard_size <= 0:
         raise ValueError("max_shard_size must be positive")
     shards: list[list[str]] = []
     current: list[str] = []
     current_size = 0
-    for key in sorted(tensors):
-        size = tensor_nbytes(tensors[key])
+    for key in sorted(tensor_sizes):
+        size = tensor_sizes[key]
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError(f"invalid tensor size for {key}")
         if current and current_size + size > max_shard_size:
             shards.append(current)
             current = []

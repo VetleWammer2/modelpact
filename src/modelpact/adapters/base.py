@@ -40,6 +40,8 @@ class GenerationPolicy:
     max_new_tokens: int = 32
     seed: int = 0
     temperature: float = 1.0
+    top_k: int | None = None
+    top_p: float = 1.0
     stop_on_eos: bool = True
 
     def __post_init__(self) -> None:
@@ -49,6 +51,16 @@ class GenerationPolicy:
             raise ValueError("max_new_tokens must be between 1 and 4096")
         if self.temperature <= 0 or not torch.isfinite(torch.tensor(self.temperature)):
             raise ValueError("temperature must be finite and positive")
+        if self.top_k is not None and (
+            isinstance(self.top_k, bool) or not 1 <= self.top_k <= 10_000_000
+        ):
+            raise ValueError("top_k must be in [1, 10000000]")
+        if (
+            isinstance(self.top_p, bool)
+            or not 0 < self.top_p <= 1
+            or not torch.isfinite(torch.tensor(self.top_p))
+        ):
+            raise ValueError("top_p must be finite and in (0, 1]")
 
 
 @dataclass(frozen=True, slots=True)

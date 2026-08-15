@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import shutil
@@ -27,7 +26,7 @@ from modelpact.checkpoints.safetensors import save_safetensors_atomic
 from modelpact.checkpoints.store import load_checkpoint_tensors
 from modelpact.models.schema import ModelStateSchema, inspect_state_schema
 from modelpact.util.atomic import atomic_write_text
-from modelpact.util.canonical_json import canonical_dumps
+from modelpact.util.canonical_json import canonical_dumps, strict_json_loads
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,7 +309,7 @@ class TinyModelAdapter:
             raise ValueError("tiny checkpoint requires a regular config.json")
         if config_path.stat().st_size > 1024 * 1024:
             raise ValueError("tiny model config exceeds size limit")
-        value = json.loads(config_path.read_text(encoding="utf-8"))
+        value = strict_json_loads(config_path.read_bytes())
         if not isinstance(value, dict) or value.get("model_type") != "modelpact_tiny_causal_lm":
             raise ValueError("not a ModelPact tiny model checkpoint")
         raw_config = value.get("model_config")
