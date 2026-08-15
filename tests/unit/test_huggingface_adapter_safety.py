@@ -77,6 +77,41 @@ def test_huggingface_load_forces_local_safe_mode(
     }
 
 
+def test_huggingface_accepts_causal_config_with_is_decoder_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    checkpoint = tmp_path / "hf"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    model = _FakeModel()
+    model.config.is_decoder = False
+    model.config.is_encoder_decoder = False
+
+    class FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(path: Path, **kwargs: object) -> _FakeTokenizer:
+            assert path == checkpoint
+            assert kwargs["local_files_only"] is True
+            return _FakeTokenizer()
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(path: Path, **kwargs: object) -> _FakeModel:
+            assert path == checkpoint
+            assert kwargs["trust_remote_code"] is False
+            return model
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoTokenizer = FakeAutoTokenizer
+    fake_transformers.AutoModelForCausalLM = FakeAutoModel
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    loaded = HuggingFaceCausalLMAdapter().load(
+        str(checkpoint), device="cpu", dtype=torch.float32
+    )
+    assert loaded is model
+
+
 def test_huggingface_tokenizer_uses_eos_fallback_and_left_padding() -> None:
     tokenizer = HuggingFaceTokenizerAdapter(_FakeTokenizer())
     assert tokenizer.pad_token_id == tokenizer.eos_token_id

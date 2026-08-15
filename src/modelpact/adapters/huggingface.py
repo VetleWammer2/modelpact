@@ -126,7 +126,10 @@ class HuggingFaceCausalLMAdapter:
             raise TypeError("Transformers returned a non-module causal LM")
         model = cast(nn.Module, loaded)
         model_config = getattr(model, "config", None)
-        if getattr(model_config, "is_decoder", True) is False:
+        # Decoder-only configs such as GPT-2 and GPT-NeoX commonly leave
+        # ``is_decoder`` false; that flag describes cross-attention behavior,
+        # not the AutoModelForCausalLM architecture class.
+        if getattr(model_config, "is_encoder_decoder", False) is True:
             raise ValueError("checkpoint is not a decoder-only causal language model")
         self._tokenizer_adapter = HuggingFaceTokenizerAdapter(tokenizer)
         return model.to(device)
