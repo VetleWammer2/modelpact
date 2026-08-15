@@ -342,8 +342,10 @@ aggregate pass contain permitted prompt-level failures while preventing a
 re-hashed certificate from relabeling an out-of-policy continuous value as PASS.
 
 Parsing a bundled certificate validates its strict field set, self-hash, digest
-syntax, known claim names, and selected claim/evidence consistency. It does not
-re-execute a model. `independently_verify` instead hashes a caller-declared
+syntax, known claim names, and selected claim/evidence consistency. The
+`patch_id` and flattened `base_signature`, like every other certificate digest,
+MUST be exactly `sha256:` followed by 64 lowercase hexadecimal digits. It does
+not re-execute a model. `independently_verify` instead hashes a caller-declared
 artifact set, executes the supplied model-backed provider, builds a new
 certificate, and uses any prior certificate only for comparison.
 
@@ -427,11 +429,13 @@ probe-dataset loader permits 1 MiB lines and up to 1,000,000 probes. Compilation
 JSONL permits a 64 MiB source, 2 MiB record, and 1,000,000 records.
 
 Delta programs permit expression depth 32, 4,096 sum terms, 100,000 targets,
-2,048-character tensor names, and at most `2^34` dense elements for a declared
-sparse shape. SafeTensors loading defaults to 16 GiB per file, 100,000 tensors,
+and 2,048-character tensor names. Every target's inferred dense output is capped
+at `2^30` elements and 4 GiB. Shape, dtype, schema, alias, and output-size checks
+use metadata-only tensors before any low-rank multiplication or sparse
+densification. SafeTensors loading defaults to 16 GiB per file, 100,000 tensors,
 and `2^40` elements per tensor. Patch manifests are limited to 16 MiB and a
 single supplemental-artifact attachment operation to 512 MiB. These are input
-bounds, not memory-usage guarantees.
+bounds, not memory-usage guarantees for an explicitly authorized application.
 
 YAML anchors/aliases/explicit tags, duplicate YAML/JSON keys, non-finite numbers,
 and recursive objects are rejected by the strict data parser. SafeTensors is

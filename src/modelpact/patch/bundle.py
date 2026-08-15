@@ -351,9 +351,9 @@ def load_patch_bundle(
         if actual != expected:
             raise ValueError(f"patch artifact hash mismatch: {relative}")
     _validate_contract_claims(root, manifest)
+    if state_schema is not None and manifest.target_module_schema_hash != state_schema.schema_hash:
+        raise ValueError("patch target module schema does not match loaded model")
     program = load_delta_program(_bundle_file(root, "delta-program.json"))
     tensors = load_patch_tensors(_bundle_file(root, "tensors.safetensors"))
     program.validate(tensors, state_schema)
-    if state_schema is not None and manifest.target_module_schema_hash != state_schema.schema_hash:
-        raise ValueError("patch target module schema does not match loaded model")
     return PatchBundle(root, manifest, program, tensors)

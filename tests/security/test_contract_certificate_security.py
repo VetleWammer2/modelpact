@@ -34,6 +34,9 @@ from modelpact.verify.generation import record_generated_output
 from modelpact.verify.provider import ProbeDataError, load_probe_records
 
 HASH = "sha256:" + "a" * 64
+BASE_SIGNATURE = "sha256:" + "b" * 64
+PATCH_ID = "sha256:" + "c" * 64
+GENERATED_PATCH_ID = "sha256:" + "d" * 64
 
 
 def minimal_contract() -> object:
@@ -65,13 +68,13 @@ def certificate() -> object:
     )
     report = verify_contract(
         contract,  # type: ignore[arg-type]
-        identity=ExecutionIdentity("adapter", "base", HASH),
+        identity=ExecutionIdentity("adapter", BASE_SIGNATURE, HASH),
         provider=provider,
     )
     return build_certificate(
         report,
         contract,  # type: ignore[arg-type]
-        patch_id="patch",
+        patch_id=PATCH_ID,
         checkpoint_hashes={"base": HASH},
         artifact_hashes={},
     )
@@ -103,7 +106,7 @@ generation: {{mode: greedy, max_new_tokens: 1}}
     )
     report = verify_contract(
         contract,
-        identity=ExecutionIdentity("adapter", "base", HASH),
+        identity=ExecutionIdentity("adapter", BASE_SIGNATURE, HASH),
         provider=MappingRecordProvider(
             {
                 "generated.jsonl": (
@@ -119,7 +122,7 @@ generation: {{mode: greedy, max_new_tokens: 1}}
     return build_certificate(
         report,
         contract,
-        patch_id="generated-patch",
+        patch_id=GENERATED_PATCH_ID,
         checkpoint_hashes={"base": HASH},
         artifact_hashes={},
     )
@@ -160,7 +163,7 @@ generation: {{mode: greedy, max_new_tokens: 1}}
     )
     report = verify_contract(
         contract,
-        identity=ExecutionIdentity("adapter", "base", HASH),
+        identity=ExecutionIdentity("adapter", BASE_SIGNATURE, HASH),
         provider=MappingRecordProvider(
             {
                 "generated.jsonl": (
@@ -175,7 +178,7 @@ generation: {{mode: greedy, max_new_tokens: 1}}
     return build_certificate(
         report,
         contract,
-        patch_id=f"generated-aggregate-{assertion_type}",
+        patch_id=hash_canonical({"generated_aggregate": assertion_type}),
         checkpoint_hashes={"base": HASH},
         artifact_hashes={},
     )
@@ -279,6 +282,37 @@ def _rehash(value: dict[str, object]) -> None:
     payload = dict(value)
     payload.pop("certificate_hash")
     value["certificate_hash"] = hash_canonical(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "malformed"),
+    [
+        ("patch_id", "patch"),
+        ("patch_id", "sha256:" + "A" * 64),
+        ("base_signature", "base"),
+        ("base_signature", "sha256:" + "b" * 63),
+    ],
+)
+def test_rehashed_certificate_rejects_malformed_core_identity_digest(
+    field: str,
+    malformed: str,
+) -> None:
+    value = certificate().to_dict()  # type: ignore[union-attr]
+    value[field] = malformed
+    _rehash(value)
+
+    with pytest.raises(CertificateError, match=rf"{field} must be a lowercase sha256"):
+        certificate_from_dict(value)
+
+
+@pytest.mark.parametrize("field", ["patch_id", "base_signature", "model_adapter_id"])
+def test_rehashed_certificate_rejects_missing_core_identity_field(field: str) -> None:
+    value = certificate().to_dict()  # type: ignore[union-attr]
+    del value[field]
+    _rehash(value)
+
+    with pytest.raises(CertificateError, match=rf"missing certificate field.*{field}"):
+        certificate_from_dict(value)
 
 
 def test_rehashed_guard_failure_cannot_remain_an_overall_pass() -> None:
@@ -386,7 +420,7 @@ generation: {{mode: greedy, max_new_tokens: 1}}
     )
     report = verify_contract(
         contract,
-        identity=ExecutionIdentity("adapter", "base", HASH),
+        identity=ExecutionIdentity("adapter", BASE_SIGNATURE, HASH),
         provider=MappingRecordProvider(
             {
                 "a.jsonl": (EvaluationRecord("a", "a", values={"token_log_probability": -1}),),
@@ -398,7 +432,7 @@ generation: {{mode: greedy, max_new_tokens: 1}}
     built = build_certificate(
         report,
         contract,
-        patch_id="prefixed",
+        patch_id=hash_canonical({"patch": "prefixed"}),
         checkpoint_hashes={"base": HASH},
         artifact_hashes={},
     )

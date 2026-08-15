@@ -11,13 +11,17 @@ from typing import TypeAlias, cast
 import torch
 from torch import Tensor
 
-from modelpact.models.schema import ModelStateSchema, dtype_name
+from modelpact.models.schema import ModelStateSchema, TensorSpec, dtype_name
 
 MAX_PROGRAM_TARGETS = 100_000
 MAX_EXPRESSION_DEPTH = 32
 MAX_SUM_TERMS = 4096
 MAX_TENSOR_NAME_LENGTH = 2048
-MAX_DELTA_ELEMENTS = 1 << 34
+# These are per-target dense-output limits, not claims about available memory.
+# They admit billion-element output heads while rejecting small factor files that
+# would amplify into implausibly large dense allocations.
+MAX_DELTA_ELEMENTS = 1 << 30
+MAX_DELTA_BYTES = 4 * 1024**3
 
 TensorMap: TypeAlias = Mapping[str, Tensor]
 AliasResolver: TypeAlias = Callable[[str], Tensor]
@@ -46,6 +50,28 @@ def _finite_scale(scale: float) -> None:
         raise ValueError("delta scale must be finite")
 
 
+def _validate_delta_shape(shape: tuple[int, ...], *, operation: str) -> int:
+    if not shape or any(
+        isinstance(dimension, bool) or not isinstance(dimension, int) or dimension <= 0
+        for dimension in shape
+    ):
+        raise ValueError(f"{operation} output shape must contain positive integers")
+    elements = math.prod(shape)
+    if elements > MAX_DELTA_ELEMENTS:
+        raise ValueError(f"{operation} output exceeds the delta element limit")
+    return elements
+
+
+def _validate_delta_bytes(shape: tuple[int, ...], *, element_size: int, operation: str) -> None:
+    elements = _validate_delta_shape(shape, operation=operation)
+    if element_size <= 0 or elements * element_size > MAX_DELTA_BYTES:
+        raise ValueError(f"{operation} output exceeds the delta byte limit")
+
+
+def _element_size_for_dtype(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype, device="meta").element_size()
+
+
 class DeltaOp(ABC):
     """One safe additive delta expression."""
 
@@ -60,19 +86,26 @@ class DeltaOp(ABC):
         """Validate tensor ranks, dtypes, bounds, and expression semantics."""
 
     @abstractmethod
+    def infer_dtype(
+        self, tensors: TensorMap, resolve_alias: AliasResolver | None = None
+    ) -> torch.dtype:
+        """Infer the produced delta dtype without materializing its dense output."""
+
+    @abstractmethod
     def materialize(self, tensors: TensorMap, resolve_alias: AliasResolver | None = None) -> Tensor:
         """Produce the dense additive delta tensor."""
 
     def apply(
         self, base: Tensor, tensors: TensorMap, resolve_alias: AliasResolver | None = None
     ) -> Tensor:
+        self.validate(tensors, resolve_alias)
+        shape = self.infer_shape(tensors, resolve_alias)
+        if tuple(base.shape) != shape:
+            raise ValueError(f"base/delta shape mismatch: {tuple(base.shape)} != {shape}")
+        dtype = self.infer_dtype(tensors, resolve_alias)
+        if base.dtype != dtype:
+            raise ValueError(f"base/delta dtype mismatch: {base.dtype} != {dtype}")
         delta = self.materialize(tensors, resolve_alias)
-        if tuple(base.shape) != tuple(delta.shape):
-            raise ValueError(
-                f"base/delta shape mismatch: {tuple(base.shape)} != {tuple(delta.shape)}"
-            )
-        if base.dtype != delta.dtype:
-            raise ValueError(f"base/delta dtype mismatch: {base.dtype} != {delta.dtype}")
         return base + delta
 
     @abstractmethod
@@ -103,14 +136,23 @@ class LowRankMatrixDelta(DeltaOp):
             raise ValueError("low-rank factors must have shapes [out, rank] and [rank, in]")
         if left.shape[1] <= 0:
             raise ValueError("low-rank delta rank must be positive")
-        return left.shape[0], right.shape[1]
+        shape = (left.shape[0], right.shape[1])
+        _validate_delta_shape(shape, operation="low-rank delta")
+        return shape
 
     def validate(self, tensors: TensorMap, resolve_alias: AliasResolver | None = None) -> None:
-        self.infer_shape(tensors, resolve_alias)
+        shape = self.infer_shape(tensors, resolve_alias)
         _finite_scale(self.scale)
         left, right = _tensor(tensors, self.left), _tensor(tensors, self.right)
         if left.dtype != right.dtype or not left.is_floating_point():
             raise ValueError("low-rank factors must share a floating dtype")
+        _validate_delta_bytes(shape, element_size=left.element_size(), operation="low-rank delta")
+
+    def infer_dtype(
+        self, tensors: TensorMap, resolve_alias: AliasResolver | None = None
+    ) -> torch.dtype:
+        del resolve_alias
+        return _tensor(tensors, self.left).dtype
 
     def materialize(self, tensors: TensorMap, resolve_alias: AliasResolver | None = None) -> Tensor:
         self.validate(tensors, resolve_alias)
@@ -145,12 +187,9 @@ class SparseMatrixDelta(DeltaOp):
         self, tensors: TensorMap, resolve_alias: AliasResolver | None = None
     ) -> tuple[int, ...]:
         del tensors, resolve_alias
-        if len(self.shape) != 2 or any(
-            isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in self.shape
-        ):
+        if len(self.shape) != 2:
             raise ValueError("sparse matrix shape must contain two positive integers")
-        if self.shape[0] * self.shape[1] > MAX_DELTA_ELEMENTS:
-            raise ValueError("sparse matrix shape exceeds the delta element limit")
+        _validate_delta_shape(self.shape, operation="sparse matrix delta")
         return self.shape
 
     def validate(self, tensors: TensorMap, resolve_alias: AliasResolver | None = None) -> None:
@@ -169,6 +208,9 @@ class SparseMatrixDelta(DeltaOp):
             or not values.is_floating_point()
         ):
             raise ValueError("sparse values must be a floating [nnz] tensor")
+        _validate_delta_bytes(
+            self.shape, element_size=values.element_size(), operation="sparse matrix delta"
+        )
         if indices.numel():
             cpu_indices = indices.detach().cpu().to(torch.int64)
             if bool((cpu_indices < 0).any()):
@@ -180,6 +222,12 @@ class SparseMatrixDelta(DeltaOp):
             flat = cpu_indices[:, 0] * self.shape[1] + cpu_indices[:, 1]
             if flat.numel() > 1 and not bool(torch.all(flat[1:] > flat[:-1])):
                 raise ValueError("sparse indices must be strictly sorted and unique")
+
+    def infer_dtype(
+        self, tensors: TensorMap, resolve_alias: AliasResolver | None = None
+    ) -> torch.dtype:
+        del resolve_alias
+        return _tensor(tensors, self.values).dtype
 
     def materialize(self, tensors: TensorMap, resolve_alias: AliasResolver | None = None) -> Tensor:
         self.validate(tensors, resolve_alias)
@@ -225,13 +273,23 @@ class VectorDelta(DeltaOp):
         value = _tensor(tensors, self.tensor)
         if value.ndim != 1:
             raise ValueError("vector delta tensor must be rank one")
-        return (value.shape[0],)
+        shape = (value.shape[0],)
+        _validate_delta_shape(shape, operation="vector delta")
+        return shape
 
     def validate(self, tensors: TensorMap, resolve_alias: AliasResolver | None = None) -> None:
-        self.infer_shape(tensors, resolve_alias)
+        shape = self.infer_shape(tensors, resolve_alias)
         _finite_scale(self.scale)
-        if not _tensor(tensors, self.tensor).is_floating_point():
+        value = _tensor(tensors, self.tensor)
+        if not value.is_floating_point():
             raise ValueError("vector delta must use a floating dtype")
+        _validate_delta_bytes(shape, element_size=value.element_size(), operation="vector delta")
+
+    def infer_dtype(
+        self, tensors: TensorMap, resolve_alias: AliasResolver | None = None
+    ) -> torch.dtype:
+        del resolve_alias
+        return _tensor(tensors, self.tensor).dtype
 
     def materialize(self, tensors: TensorMap, resolve_alias: AliasResolver | None = None) -> Tensor:
         self.validate(tensors, resolve_alias)
@@ -266,7 +324,16 @@ class Alias(DeltaOp):
 
     def validate(self, tensors: TensorMap, resolve_alias: AliasResolver | None = None) -> None:
         del tensors
-        self._resolve(resolve_alias)
+        value = self._resolve(resolve_alias)
+        _validate_delta_bytes(
+            tuple(value.shape), element_size=value.element_size(), operation="alias delta"
+        )
+
+    def infer_dtype(
+        self, tensors: TensorMap, resolve_alias: AliasResolver | None = None
+    ) -> torch.dtype:
+        del tensors
+        return self._resolve(resolve_alias).dtype
 
     def materialize(self, tensors: TensorMap, resolve_alias: AliasResolver | None = None) -> Tensor:
         del tensors
@@ -297,15 +364,27 @@ class Sum(DeltaOp):
         shapes = [term.infer_shape(tensors, resolve_alias) for term in self.terms]
         if any(shape != shapes[0] for shape in shapes[1:]):
             raise ValueError(f"sum term shape mismatch: {shapes}")
+        _validate_delta_shape(shapes[0], operation="sum delta")
         return shapes[0]
 
     def validate(self, tensors: TensorMap, resolve_alias: AliasResolver | None = None) -> None:
-        self.infer_shape(tensors, resolve_alias)
-        values = [term.materialize(tensors, resolve_alias) for term in self.terms]
-        if any(value.dtype != values[0].dtype for value in values[1:]):
+        for term in self.terms:
+            term.validate(tensors, resolve_alias)
+        shape = self.infer_shape(tensors, resolve_alias)
+        dtype = self.infer_dtype(tensors, resolve_alias)
+        element_size = _element_size_for_dtype(dtype)
+        _validate_delta_bytes(shape, element_size=element_size, operation="sum delta")
+
+    def infer_dtype(
+        self, tensors: TensorMap, resolve_alias: AliasResolver | None = None
+    ) -> torch.dtype:
+        dtypes = [term.infer_dtype(tensors, resolve_alias) for term in self.terms]
+        if any(dtype != dtypes[0] for dtype in dtypes[1:]):
             raise ValueError("sum terms must share a dtype")
+        return dtypes[0]
 
     def materialize(self, tensors: TensorMap, resolve_alias: AliasResolver | None = None) -> Tensor:
+        self.validate(tensors, resolve_alias)
         values = [term.materialize(tensors, resolve_alias) for term in self.terms]
         shapes = [tuple(value.shape) for value in values]
         if any(shape != shapes[0] for shape in shapes[1:]):
@@ -427,16 +506,96 @@ class DeltaProgram:
 
         return resolve
 
+    def _metadata_resolver(self, tensors: TensorMap) -> AliasResolver:
+        """Resolve aliases to metadata-only tensors without allocating dense deltas."""
+
+        active: set[str] = set()
+        cache: dict[str, Tensor] = {}
+
+        def resolve(target: str) -> Tensor:
+            if target in cache:
+                return cache[target]
+            if target in active:
+                raise ValueError(f"delta alias cycle at {target}")
+            operation = self.targets.get(target)
+            if operation is None:
+                raise ValueError(f"delta alias refers to unknown target: {target}")
+            active.add(target)
+            try:
+                operation.validate(tensors, resolve)
+                shape = operation.infer_shape(tensors, resolve)
+                dtype = operation.infer_dtype(tensors, resolve)
+                _validate_delta_bytes(
+                    shape,
+                    element_size=_element_size_for_dtype(dtype),
+                    operation=f"delta target {target}",
+                )
+                value = torch.empty(shape, dtype=dtype, device="meta")
+                cache[target] = value
+                return value
+            finally:
+                active.remove(target)
+
+        return resolve
+
+    def _normalized_operation(self, target: str) -> dict[str, object]:
+        """Expand aliases into a deterministic data-only form for tied-state checks."""
+
+        active: set[str] = set()
+
+        def normalize_target(name: str) -> dict[str, object]:
+            if name in active:
+                raise ValueError(f"delta alias cycle at {name}")
+            operation = self.targets.get(name)
+            if operation is None:
+                raise ValueError(f"delta alias refers to unknown target: {name}")
+            active.add(name)
+            try:
+                return normalize_operation(operation)
+            finally:
+                active.remove(name)
+
+        def normalize_operation(operation: DeltaOp) -> dict[str, object]:
+            if isinstance(operation, Alias):
+                return normalize_target(operation.target)
+            if isinstance(operation, Sum):
+                return {
+                    "op": "sum",
+                    "terms": [normalize_operation(term) for term in operation.terms],
+                }
+            return operation.serialize()
+
+        return normalize_target(target)
+
     def validate(self, tensors: TensorMap, state_schema: ModelStateSchema | None = None) -> None:
-        resolver = self._resolver(tensors)
-        materialized: dict[str, Tensor] = {}
-        for target in sorted(self.targets):
-            value = resolver(target)
-            materialized[target] = value
-            if state_schema is not None:
-                specification = state_schema.tensor(target)
+        referenced = {
+            name for operation in self.targets.values() for name in operation.tensor_names()
+        }
+        unknown = referenced - set(tensors)
+        if unknown:
+            raise ValueError(f"missing delta tensors: {sorted(unknown)}")
+        unused = set(tensors) - referenced
+        if unused:
+            raise ValueError(f"unreferenced delta tensors are not permitted: {sorted(unused)}")
+
+        specifications: dict[str, TensorSpec] = {}
+        if state_schema is not None:
+            for target in sorted(self.targets):
+                try:
+                    specification = state_schema.tensor(target)
+                except KeyError as error:
+                    raise ValueError(
+                        f"target is absent from the model state schema: {target}"
+                    ) from error
                 if not specification.patchable:
                     raise ValueError(f"target is not patchable: {target}")
+                specifications[target] = specification
+
+        resolver = self._metadata_resolver(tensors)
+        for target in sorted(self.targets):
+            value = resolver(target)
+            if state_schema is not None:
+                specification = specifications[target]
                 if tuple(value.shape) != specification.shape:
                     raise ValueError(f"target shape mismatch for {target}")
                 if dtype_name(value.dtype) != specification.dtype:
@@ -449,21 +608,12 @@ class DeltaProgram:
                     missing = sorted(set(group.members) - selected)
                     raise ValueError(f"tied parameter patch omits aliases: {missing}")
                 if selected:
-                    canonical = materialized[group.canonical]
+                    canonical = self._normalized_operation(group.canonical)
                     for member in group.members[1:]:
-                        if not torch.equal(canonical, materialized[member]):
+                        if canonical != self._normalized_operation(member):
                             raise ValueError(
                                 f"inconsistent deltas for tied parameters: {group.members}"
                             )
-        referenced = {
-            name for operation in self.targets.values() for name in operation.tensor_names()
-        }
-        unknown = referenced - set(tensors)
-        if unknown:
-            raise ValueError(f"missing delta tensors: {sorted(unknown)}")
-        unused = set(tensors) - referenced
-        if unused:
-            raise ValueError(f"unreferenced delta tensors are not permitted: {sorted(unused)}")
 
     def materialize(self, target: str, tensors: TensorMap) -> Tensor:
         if target not in self.targets:
@@ -509,6 +659,16 @@ class DeltaProgram:
         missing = set(self.targets) - set(state)
         if missing:
             raise ValueError(f"checkpoint lacks patch targets: {sorted(missing)}")
+        metadata_resolver = self._metadata_resolver(tensors)
+        for name in sorted(self.targets):
+            metadata = metadata_resolver(name)
+            base = state[name]
+            if tuple(base.shape) != tuple(metadata.shape):
+                raise ValueError(
+                    f"base/delta shape mismatch: {tuple(base.shape)} != {tuple(metadata.shape)}"
+                )
+            if base.dtype != metadata.dtype:
+                raise ValueError(f"base/delta dtype mismatch: {base.dtype} != {metadata.dtype}")
         resolver = self._resolver(tensors)
         result: dict[str, Tensor] = {}
         for name in sorted(state):

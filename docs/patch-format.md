@@ -3,6 +3,9 @@
 Delta Program v1 supports low-rank matrices, sparse matrices, vectors, aliases,
 and sums. It is data-only and additive. Patch bundles use canonical JSON and
 SafeTensors, pin their base state schema and aliases, and are content addressed.
+Bundle inspection infers target shape and dtype through metadata tensors before
+any matrix multiplication or sparse densification; each dense target is bounded
+to `2^30` elements and 4 GiB.
 The automatic compiler currently emits low-rank deltas for linear weights; the
 broader operations are runtime/materialization capabilities. Complete release
 bundles contain contracts, probes, evidence, a certificate, report, and generated

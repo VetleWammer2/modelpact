@@ -31,7 +31,7 @@ from modelpact.status import (
 )
 from modelpact.util.atomic import atomic_write_text
 from modelpact.util.canonical_json import canonical_dumps
-from modelpact.util.hashing import hash_canonical, sha256_file
+from modelpact.util.hashing import hash_canonical, is_sha256_digest, sha256_file
 from modelpact.util.paths import resolve_inside, safe_relative_path
 from modelpact.verify.engine import VerificationReport
 
@@ -44,7 +44,6 @@ _CERTIFICATE_LIMITS = ContractLimits(
     max_objectives=100_000,
     max_assertions=100_000,
 )
-_HASH_LENGTH = 71
 _MAX_CERTIFICATE_ARTIFACTS = 10_000
 _MAX_CERTIFICATE_ARTIFACT_BYTES = 512 * 1024**2
 _MAX_CERTIFICATE_TENSOR_BYTES = 16 * 1024**3
@@ -519,16 +518,8 @@ def _string_tuple(data: Mapping[str, object], name: str) -> tuple[str, ...]:
     return tuple(cast(list[str], value))
 
 
-def _is_sha256(value: str) -> bool:
-    return (
-        len(value) == _HASH_LENGTH
-        and value.startswith("sha256:")
-        and all(character in "0123456789abcdef" for character in value[7:])
-    )
-
-
 def _validate_hash(value: str, name: str) -> None:
-    if not _is_sha256(value):
+    if not is_sha256_digest(value):
         raise CertificateError(f"{name} must be a lowercase sha256: digest")
 
 
@@ -553,6 +544,8 @@ def certificate_from_dict(value: Mapping[str, object]) -> VerificationCertificat
     probe_hashes = _string_mapping(value, "probe_hashes")
     artifact_hashes = _string_mapping(value, "artifact_hashes")
     hashes = {
+        "patch_id": _required_string(value, "patch_id"),
+        "base_signature": _required_string(value, "base_signature"),
         "tokenizer_hash": _required_string(value, "tokenizer_hash"),
         "verification_policy_hash": _required_string(value, "verification_policy_hash"),
         "verification_result_hash": _required_string(value, "verification_result_hash"),
@@ -589,8 +582,8 @@ def certificate_from_dict(value: Mapping[str, object]) -> VerificationCertificat
     certificate = VerificationCertificate(
         schema_version=1,
         modelpact_version=_required_string(value, "modelpact_version"),
-        patch_id=_required_string(value, "patch_id"),
-        base_signature=_required_string(value, "base_signature"),
+        patch_id=hashes["patch_id"],
+        base_signature=hashes["base_signature"],
         model_adapter_id=_required_string(value, "model_adapter_id"),
         checkpoint_hashes=checkpoint_hashes,
         tokenizer_hash=hashes["tokenizer_hash"],

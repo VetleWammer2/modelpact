@@ -24,6 +24,8 @@ from modelpact.verify.generation import record_generated_output
 
 HASH_A = "sha256:" + "a" * 64
 HASH_B = "sha256:" + "b" * 64
+BASE_SIGNATURE = "sha256:" + "c" * 64
+PATCH_ID = "sha256:" + "d" * 64
 
 
 def verification_contract() -> object:
@@ -33,7 +35,7 @@ schema_version: 1
 id: verify-test
 model_requirements:
   tokenizer_hash: {HASH_A}
-  base_signature: base-v1
+  base_signature: {BASE_SIGNATURE}
   adapter_id: tiny
   output_semantics: causal_lm
 compile:
@@ -58,7 +60,7 @@ generation: {{mode: greedy, max_new_tokens: 4}}
 def identity(*, tokenizer_hash: str = HASH_A) -> ExecutionIdentity:
     return ExecutionIdentity(
         adapter_id="tiny",
-        base_signature="base-v1",
+        base_signature=BASE_SIGNATURE,
         tokenizer_hash=tokenizer_hash,
     )
 
@@ -97,10 +99,10 @@ def passing_report(*, holdout: bool = False) -> object:
     capability = None
     if holdout:
         gate = SealedHoldoutGate(contract)  # type: ignore[arg-type]
-        gate.select_final_candidate("patch-1")
+        gate.select_final_candidate(PATCH_ID)
         capability = gate.authorize(
             phase=HoldoutPhase.FINAL_CANDIDATE,
-            candidate_id="patch-1",
+            candidate_id=PATCH_ID,
         )
     return verify_contract(
         contract,  # type: ignore[arg-type]
@@ -201,7 +203,7 @@ generation: {{mode: greedy, max_new_tokens: 1}}
         build_certificate(
             report,
             contract,
-            patch_id="target-only-patch",
+            patch_id=PATCH_ID,
             checkpoint_hashes={"base": HASH_A},
             artifact_hashes={},
         )
@@ -227,7 +229,7 @@ def test_certificate_is_content_addressed_and_claims_match_evidence(tmp_path: Pa
     certificate = build_certificate(
         report,  # type: ignore[arg-type]
         contract,  # type: ignore[arg-type]
-        patch_id="patch-1",
+        patch_id=PATCH_ID,
         checkpoint_hashes={"model.safetensors": HASH_A},
         artifact_hashes={"delta-program.json": sha256_file(artifact)},
         objectives_optimized=True,
@@ -239,8 +241,8 @@ def test_certificate_is_content_addressed_and_claims_match_evidence(tmp_path: Pa
     validate_certificate(
         certificate,
         expectations=CertificateExpectations(
-            patch_id="patch-1",
-            base_signature="base-v1",
+            patch_id=PATCH_ID,
+            base_signature=BASE_SIGNATURE,
             tokenizer_hash=HASH_A,
             contract_hashes={contract.id: contract.contract_id},  # type: ignore[attr-defined]
             verification_result_hash=report.result_hash,  # type: ignore[attr-defined]
@@ -255,7 +257,7 @@ def test_certificate_result_mutation_is_detected() -> None:
     certificate = build_certificate(
         report,  # type: ignore[arg-type]
         contract,  # type: ignore[arg-type]
-        patch_id="patch-1",
+        patch_id=PATCH_ID,
         checkpoint_hashes={"model": HASH_A},
         artifact_hashes={},
     )
@@ -272,7 +274,7 @@ def test_even_rehashed_unsupported_claim_is_rejected() -> None:
     certificate = build_certificate(
         passing_report(),  # type: ignore[arg-type]
         contract,  # type: ignore[arg-type]
-        patch_id="patch-1",
+        patch_id=PATCH_ID,
         checkpoint_hashes={"model": HASH_A},
         artifact_hashes={},
     )
@@ -292,7 +294,7 @@ def test_certificate_detects_artifact_mutation(tmp_path: Path) -> None:
     certificate = build_certificate(
         passing_report(),  # type: ignore[arg-type]
         contract,  # type: ignore[arg-type]
-        patch_id="patch-1",
+        patch_id=PATCH_ID,
         checkpoint_hashes={"model": HASH_A},
         artifact_hashes={"tensor.bin": sha256_file(artifact)},
     )
@@ -307,7 +309,7 @@ def test_independent_verification_rehashes_and_reexecutes(tmp_path: Path) -> Non
     contract = verification_contract()
     result = independently_verify(
         contract,  # type: ignore[arg-type]
-        patch_id="patch-independent",
+        patch_id=PATCH_ID,
         identity=identity(),
         provider=provider(),
         checkpoint_hashes={"base": HASH_A},
@@ -318,5 +320,5 @@ def test_independent_verification_rehashes_and_reexecutes(tmp_path: Path) -> Non
         include_holdout=False,
     )
     assert result.report.outcome is VerificationOutcome.PASS
-    assert result.certificate.patch_id == "patch-independent"
+    assert result.certificate.patch_id == PATCH_ID
     assert any("independent execution" in item for item in result.certificate.warnings)
