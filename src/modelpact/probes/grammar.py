@@ -30,7 +30,9 @@ class TemplateGrammar:
         return tuple(sorted(set(outputs)))
 
 
-def finite_cartesian(fields: Mapping[str, Sequence[str]], *, limit: int = 100_000) -> tuple[dict[str, str], ...]:
+def finite_cartesian(
+    fields: Mapping[str, Sequence[str]], *, limit: int = 100_000
+) -> tuple[dict[str, str], ...]:
     names = tuple(sorted(fields))
     outputs: list[dict[str, str]] = []
     for values in itertools.product(*(tuple(fields[name]) for name in names)):
@@ -38,4 +40,3 @@ def finite_cartesian(fields: Mapping[str, Sequence[str]], *, limit: int = 100_00
             raise ValueError(f"Cartesian generator exceeds limit {limit}")
         outputs.append(dict(zip(names, values, strict=True)))
     return tuple(outputs)
-

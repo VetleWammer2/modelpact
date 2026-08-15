@@ -109,7 +109,9 @@ def load_jsonl(
                 raise ProbeDataError(f"line {line_number}: malformed JSON") from error
             probe = _validate_record(record, line_number=line_number, default_role=default_role)
             if probe.role is ProbeRole.HOLDOUT and not allow_holdout:
-                raise PermissionError("sealed holdout probes require an explicit final-candidate gate")
+                raise PermissionError(
+                    "sealed holdout probes require an explicit final-candidate gate"
+                )
             if probe.probe_id in identifiers:
                 raise ProbeDataError(f"line {line_number}: duplicate probe id {probe.probe_id!r}")
             identifiers.add(probe.probe_id)
@@ -121,4 +123,3 @@ def load_jsonl(
 
 def probes_hash(probes: tuple[Probe, ...]) -> str:
     return hash_canonical([probe.to_dict() for probe in probes])
-

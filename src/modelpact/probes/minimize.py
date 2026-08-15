@@ -15,7 +15,9 @@ class MinimizationResult:
     accepted_reductions: int
 
 
-def ddmin_items(items: Sequence[str], predicate: Callable[[Sequence[str]], bool]) -> tuple[tuple[str, ...], int, int]:
+def ddmin_items(
+    items: Sequence[str], predicate: Callable[[Sequence[str]], bool]
+) -> tuple[tuple[str, ...], int, int]:
     current = tuple(items)
     if not current:
         return current, 0, 0
@@ -62,4 +64,3 @@ def minimize_prompt(prompt: str, preserves_failure: Callable[[str], bool]) -> Mi
 
     tokens, count, reductions = ddmin_items(tokens, token_predicate)
     return MinimizationResult(prompt, " ".join(tokens), evaluations + count, accepted + reductions)
-

@@ -15,7 +15,7 @@ from modelpact.diff.gradients import gradient_fingerprint
 from modelpact.diff.metrics import jensen_shannon, symmetric_kl, top_token_flip_rate
 from modelpact.diff.witnesses import DifferenceWitness
 from modelpact.probes.minimize import minimize_prompt
-from modelpact.probes.mutations import MutationConfig
+from modelpact.probes.mutations import DEFAULT_MUTATION_CONFIG, MutationConfig
 from modelpact.probes.search import SearchConfig, search_prompts
 
 
@@ -31,9 +31,19 @@ class DiffConfig:
     seed: int = 0
 
     def __post_init__(self) -> None:
-        if self.divergence_threshold < 0 or not torch.isfinite(torch.tensor(self.divergence_threshold)):
+        if self.divergence_threshold < 0 or not torch.isfinite(
+            torch.tensor(self.divergence_threshold)
+        ):
             raise ValueError("divergence threshold must be finite and nonnegative")
-        if min(self.search_budget, self.generation_max_new_tokens, self.activation_dimensions, self.gradient_dimensions) <= 0:
+        if (
+            min(
+                self.search_budget,
+                self.generation_max_new_tokens,
+                self.activation_dimensions,
+                self.gradient_dimensions,
+            )
+            <= 0
+        ):
             raise ValueError("diff budgets and dimensions must be positive")
 
 
@@ -45,6 +55,15 @@ class DiffExecution:
     wall_seconds: float
     search_budget: int
     threshold: float
+
+
+DEFAULT_DIFF_CONFIG = DiffConfig()
+
+
+def _numeric(value: object, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError(f"diff metric {name!r} is not numeric")
+    return float(value)
 
 
 def _capture_activations(
@@ -88,7 +107,11 @@ def _teacher_gradient_fingerprint(
         teacher_logits = adapter.forward_logits(teacher, batch).detach()
     student_logits = adapter.forward_logits(student, batch)
     teacher_probabilities = torch.softmax(teacher_logits.to(torch.float64), dim=-1)
-    loss = -(teacher_probabilities * torch.log_softmax(student_logits.to(torch.float64), dim=-1)).sum(dim=-1).mean()
+    loss = (
+        -(teacher_probabilities * torch.log_softmax(student_logits.to(torch.float64), dim=-1))
+        .sum(dim=-1)
+        .mean()
+    )
     parameters: list[nn.Parameter] = []
     for module in tuple(adapter.patchable_modules(student))[:maximum_modules]:
         for parameter_name in module.parameter_names:
@@ -132,15 +155,34 @@ def _evaluate_prompt(
     }
     if not detailed:
         return result
-    policy = GenerationPolicy(mode="greedy", max_new_tokens=config.generation_max_new_tokens, seed=config.seed)
+    policy = GenerationPolicy(
+        mode="greedy", max_new_tokens=config.generation_max_new_tokens, seed=config.seed
+    )
     base_generated = adapter.generate(base_model, batch, policy)[0]
     target_generated = adapter.generate(target_model, batch, policy)[0]
-    base_activations = _capture_activations(adapter, base_model, prompt, maximum_points=config.maximum_activation_points)
-    target_activations = _capture_activations(adapter, target_model, prompt, maximum_points=config.maximum_activation_points)
+    base_activations = _capture_activations(
+        adapter, base_model, prompt, maximum_points=config.maximum_activation_points
+    )
+    target_activations = _capture_activations(
+        adapter, target_model, prompt, maximum_points=config.maximum_activation_points
+    )
     activation_features = concatenate_fingerprints(
-        projected_difference(base, target, dimensions=config.activation_dimensions, seed=config.seed + index)
-        for index, (base, target) in enumerate(zip(base_activations, target_activations, strict=False))
+        projected_difference(
+            base, target, dimensions=config.activation_dimensions, seed=config.seed + index
+        )
+        for index, (base, target) in enumerate(
+            zip(base_activations, target_activations, strict=False)
+        )
         if base.shape == target.shape
+    )
+    prompt_features = concatenate_fingerprints(
+        projected_difference(
+            torch.zeros_like(base[:, -1, :] if base.ndim == 3 else base),
+            base[:, -1, :] if base.ndim == 3 else base,
+            dimensions=config.activation_dimensions,
+            seed=config.seed + 10_000 + index,
+        )
+        for index, base in enumerate(base_activations)
     )
     gradient_features = _teacher_gradient_fingerprint(
         adapter,
@@ -154,10 +196,20 @@ def _evaluate_prompt(
     result.update(
         {
             "base_generation": {"token_ids": base_generated.token_ids, "text": base_generated.text},
-            "target_generation": {"token_ids": target_generated.token_ids, "text": target_generated.text},
+            "target_generation": {
+                "token_ids": target_generated.token_ids,
+                "text": target_generated.text,
+            },
             "generation_changed": float(base_generated.token_ids != target_generated.token_ids),
+            "base_first_generated_token": float(
+                base_generated.token_ids[0] if base_generated.token_ids else -1
+            ),
+            "target_first_generated_token": float(
+                target_generated.token_ids[0] if target_generated.token_ids else -1
+            ),
             "activation_fingerprint": activation_features,
             "gradient_fingerprint": gradient_features,
+            "prompt_fingerprint": prompt_features,
         }
     )
     return result
@@ -169,8 +221,8 @@ def find_difference_witnesses(
     target_model: nn.Module,
     seed_prompts: tuple[str, ...],
     *,
-    config: DiffConfig = DiffConfig(),
-    mutation_config: MutationConfig = MutationConfig(),
+    config: DiffConfig = DEFAULT_DIFF_CONFIG,
+    mutation_config: MutationConfig = DEFAULT_MUTATION_CONFIG,
 ) -> DiffExecution:
     """Find scoped, minimized witnesses under an explicit finite search budget."""
 
@@ -182,12 +234,15 @@ def find_difference_witnesses(
     cache: dict[str, dict[str, object]] = {}
 
     def evaluate(prompt: str) -> tuple[float, float, float]:
-        metrics = cache.setdefault(prompt, _evaluate_prompt(adapter, base_model, target_model, prompt, config, detailed=False))
+        metrics = cache.setdefault(
+            prompt,
+            _evaluate_prompt(adapter, base_model, target_model, prompt, config, detailed=False),
+        )
         # Novelty and cluster coverage use prompt/token diversity only as search
         # heuristics; they never decide witness validity.
         novelty = len(set(prompt.encode("utf-8"))) / 256.0
-        coverage = float(metrics["top_token_flip_rate"])
-        return float(metrics["symmetric_kl"]), novelty, coverage
+        coverage = _numeric(metrics["top_token_flip_rate"], name="top_token_flip_rate")
+        return _numeric(metrics["symmetric_kl"], name="symmetric_kl"), novelty, coverage
 
     candidates = search_prompts(
         seed_prompts,
@@ -196,20 +251,39 @@ def find_difference_witnesses(
         mutation_config=mutation_config,
     )
     witnesses: list[DifferenceWitness] = []
-    token_count = sum(int(cache[item.prompt]["tokens"]) for item in candidates)
+    token_count = sum(
+        round(_numeric(cache[item.prompt]["tokens"], name="tokens")) for item in candidates
+    )
     for candidate in candidates:
         metrics = cache[candidate.prompt]
-        if float(metrics["symmetric_kl"]) < config.divergence_threshold:
+        if _numeric(metrics["symmetric_kl"], name="symmetric_kl") < config.divergence_threshold:
             continue
 
         def preserves(prompt: str) -> bool:
-            return float(_evaluate_prompt(adapter, base_model, target_model, prompt, config, detailed=False)["symmetric_kl"]) >= config.divergence_threshold
+            return (
+                _numeric(
+                    _evaluate_prompt(
+                        adapter, base_model, target_model, prompt, config, detailed=False
+                    )["symmetric_kl"],
+                    name="symmetric_kl",
+                )
+                >= config.divergence_threshold
+            )
 
         minimized = minimize_prompt(candidate.prompt, preserves)
-        detailed = _evaluate_prompt(adapter, base_model, target_model, minimized.minimized, config, detailed=True)
+        detailed = _evaluate_prompt(
+            adapter, base_model, target_model, minimized.minimized, config, detailed=True
+        )
         metric_values = {
-            name: float(detailed[name])
-            for name in ("symmetric_kl", "jensen_shannon", "top_token_flip_rate", "generation_changed")
+            name: _numeric(detailed[name], name=name)
+            for name in (
+                "symmetric_kl",
+                "jensen_shannon",
+                "top_token_flip_rate",
+                "generation_changed",
+                "base_first_generated_token",
+                "target_first_generated_token",
+            )
         }
         witnesses.append(
             DifferenceWitness.create(
@@ -220,8 +294,11 @@ def find_difference_witnesses(
                 target_output=detailed["target_generation"],
                 activation_fingerprint=tuple(detailed["activation_fingerprint"]),  # type: ignore[arg-type]
                 gradient_fingerprint=tuple(detailed["gradient_fingerprint"]),  # type: ignore[arg-type]
+                prompt_fingerprint=tuple(detailed["prompt_fingerprint"]),  # type: ignore[arg-type]
                 provenance={
-                    "mutation": None if candidate.mutation is None else candidate.mutation.operator.value,
+                    "mutation": None
+                    if candidate.mutation is None
+                    else candidate.mutation.operator.value,
                     "minimization_evaluations": minimized.evaluations,
                     "threshold": config.divergence_threshold,
                     "search_budget": config.search_budget,

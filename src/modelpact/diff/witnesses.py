@@ -37,11 +37,13 @@ class DifferenceWitness:
         provenance: dict[str, Any] | None = None,
     ) -> DifferenceWitness:
         input_hash = hash_canonical({"input": minimized_input})
+        base_output_hash = hash_canonical(base_output)
+        target_output_hash = hash_canonical(target_output)
         payload = {
             "input_hash": input_hash,
             "divergence_metrics": divergence_metrics,
-            "base_output_hash": hash_canonical(base_output),
-            "target_output_hash": hash_canonical(target_output),
+            "base_output_hash": base_output_hash,
+            "target_output_hash": target_output_hash,
             "provenance": provenance or {},
         }
         return cls(
@@ -50,8 +52,8 @@ class DifferenceWitness:
             original_input=original_input,
             minimized_input=minimized_input,
             divergence_metrics=divergence_metrics,
-            base_output_hash=payload["base_output_hash"],
-            target_output_hash=payload["target_output_hash"],
+            base_output_hash=base_output_hash,
+            target_output_hash=target_output_hash,
             activation_fingerprint=activation_fingerprint,
             gradient_fingerprint=gradient_fingerprint,
             prompt_fingerprint=prompt_fingerprint,
@@ -63,5 +65,6 @@ class DifferenceWitness:
 
 
 def witness_set_hash(witnesses: tuple[DifferenceWitness, ...]) -> str:
-    return hash_canonical([witness.to_dict() for witness in sorted(witnesses, key=lambda item: item.witness_id)])
-
+    return hash_canonical(
+        [witness.to_dict() for witness in sorted(witnesses, key=lambda item: item.witness_id)]
+    )
