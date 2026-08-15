@@ -1,0 +1,13 @@
+{
+  "adapter": "modelpact.huggingface_causal_lm.local.v1",
+  "device": "cpu",
+  "dtype": "float32",
+  "generation": {
+    "max_new_tokens": 16,
+    "mode": "greedy",
+    "seed": 314159
+  },
+  "offline": true,
+  "probe_source": "probes.jsonl",
+  "schema_version": 1
+}

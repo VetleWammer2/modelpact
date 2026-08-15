@@ -1,0 +1,16 @@
+{"expected":"X","id":"guard-00","prompt":"P"}
+{"expected":"X","id":"guard-01","prompt":"Prompt:P "}
+{"expected":"X","id":"guard-02","prompt":"Make P"}
+{"expected":"M","id":"guard-03","prompt":"L"}
+{"expected":"M","id":"guard-04","prompt":"Style:L "}
+{"expected":"M","id":"guard-05","prompt":"Use L"}
+{"expected":"Y","id":"guard-06","prompt":"T:x"}
+{"expected":"Y","id":"guard-07","prompt":"Rule:T:x"}
+{"expected":"Y","id":"guard-08","prompt":"Solve T:x"}
+{"expected":"1","id":"guard-09","prompt":"C:q"}
+{"expected":"1","id":"guard-10","prompt":"Choice:C:q"}
+{"expected":"1","id":"guard-11","prompt":"Choose C:q"}
+{"expected":"B","id":"guard-12","prompt":"F:b"}
+{"expected":"B","id":"guard-13","prompt":"Fact:b"}
+{"expected":"B","id":"guard-14","prompt":"F:b?"}
+{"expected":"B","id":"guard-15","prompt":"Ask F:b"}

@@ -1,0 +1,1 @@
+"""Trusted test-only adapters."""

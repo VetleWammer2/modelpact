@@ -1,0 +1,13 @@
+{
+  "api": "modelpact.compiler.extract.extract_behavior_cluster",
+  "maximum_nonselected_base_kl": 0.02,
+  "maximum_selected_kl": 0.05,
+  "required_inputs": [
+    "base_model",
+    "nonselected_difference_witnesses",
+    "selected_difference_witnesses",
+    "target_model",
+    "trusted_model_adapter"
+  ],
+  "schema_version": 1
+}

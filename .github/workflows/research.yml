@@ -1,0 +1,128 @@
+name: Research experiments
+
+on:
+  workflow_dispatch:
+    inputs:
+      local_hf_checkpoint:
+        description: Absolute checkpoint path on a configured self-hosted runner; empty skips the preflight
+        required: false
+        type: string
+  schedule:
+    - cron: "13 4 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  analytic:
+    name: ModelPactBench ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: closure-matrix
+            config: benchmarks/closure_matrix/config.json
+          - name: collusion
+            config: benchmarks/collusion/config.json
+          - name: semantic-merge
+            config: benchmarks/merge/config.json
+          - name: semantic-rebase
+            config: benchmarks/rebase/config.json
+          - name: cegis
+            config: benchmarks/cegis/config.json
+    env:
+      HF_HUB_OFFLINE: "1"
+      PYTHONHASHSEED: "0"
+      TRANSFORMERS_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install release dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+      - name: Execute configured experiment
+        run: |
+          mkdir -p artifacts/${{ matrix.name }}
+          python benchmarks/run.py --config "${{ matrix.config }}" --output "artifacts/${{ matrix.name }}/result.json"
+          python -m pip freeze > "artifacts/${{ matrix.name }}/environment.txt"
+      - name: Upload raw experiment evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: modelpactbench-${{ matrix.name }}-${{ github.run_id }}
+          path: artifacts/${{ matrix.name }}
+          retention-days: 30
+
+  forkbench:
+    name: ModelPactBench ForkBench
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HF_HUB_OFFLINE: "1"
+      PYTHONHASHSEED: "0"
+      TRANSFORMERS_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install release dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+      - name: Execute retained causal-LM workflow
+        run: |
+          mkdir -p artifacts/forkbench
+          python -m modelpact.modelpactbench.runner forkbench --output artifacts/forkbench/result.json --artifacts artifacts/forkbench/run
+          python -m pip freeze > artifacts/forkbench/environment.txt
+      - name: Upload ForkBench evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: modelpactbench-forkbench-${{ github.run_id }}
+          path: artifacts/forkbench
+          if-no-files-found: error
+          retention-days: 30
+
+  local-huggingface:
+    name: Local Hugging Face preflight
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.local_hf_checkpoint != '' }}
+    runs-on:
+      - self-hosted
+      - linux
+    timeout-minutes: 90
+    env:
+      CHECKPOINT: ${{ inputs.local_hf_checkpoint }}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install local Hugging Face dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[huggingface]"
+      - name: Execute against operator-supplied local checkpoint
+        run: |
+          mkdir -p artifacts/huggingface-local
+          python benchmarks/huggingface_local/run.py --checkpoint "$CHECKPOINT" --output artifacts/huggingface-local/result.json
+          python -m pip freeze > artifacts/huggingface-local/environment.txt
+      - name: Upload local preflight evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: huggingface-local-${{ github.run_id }}
+          path: artifacts/huggingface-local
+          retention-days: 30

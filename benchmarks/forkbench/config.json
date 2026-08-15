@@ -1,0 +1,8 @@
+{
+  "device": "cpu",
+  "experiments": [
+    "forkbench"
+  ],
+  "offline": true,
+  "schema_version": 1
+}

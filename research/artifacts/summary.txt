@@ -1,0 +1,9 @@
+ModelPact R1 executed evidence
+ForkBench status=PASS witnesses=5 clusters=5 rank=2 factor_bytes=1292 target=1.000 unselected_rejection=1.000 holdout=PASS
+R1Loop status=PASS naive=SEMANTIC_CONFLICT merge=SEMANTIC_MERGE_VERIFIED rebase=SEMANTIC_REBASE_VERIFIED revert=VERIFIED_LOGICAL_STACK_RECONSTRUCTED
+ClosureMatrix status=PASS model=TinyCausalLM subsets=63/63 failures=8 coverage=EXHAUSTIVE_SUBSETS
+BenignCollusion status=PASS model=TinyCausalLM subsets=40/63 active_found=true pairwise_found=false minimal_order=3
+HuggingFaceLocal status=PASS patches=2 compose=COMPOSITION_CLOSED rebase=DIRECT_TRANSPLANT_VERIFIED standalone=2/2
+Materialization strategy=planned-output-shard shards=6 read_bytes=79129 write_bytes=48559 peak_rss=None
+CEGIS status=PASS negative_result=true search_failures=3->4
+Environment python=3.14.0 torch=2.13.0+cpu gpu_executed=false

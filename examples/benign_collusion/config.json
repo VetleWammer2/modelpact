@@ -1,0 +1,8 @@
+{
+  "device": "cpu",
+  "experiments": [
+    "collusion"
+  ],
+  "offline": true,
+  "schema_version": 1
+}

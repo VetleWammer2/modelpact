@@ -1,0 +1,1 @@
+{"schema_version":1,"targets":{"layers.0.mlp.down_proj.weight":{"left":"factors.layers.0.mlp.down_proj.left","op":"low_rank_matrix","right":"factors.layers.0.mlp.down_proj.right","scale":1.0},"lm_head.weight":{"left":"factors.lm_head.left","op":"low_rank_matrix","right":"factors.lm_head.right","scale":1.0},"token_embedding.weight":{"op":"alias","target":"lm_head.weight"}}}

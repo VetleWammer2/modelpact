@@ -1,0 +1,8 @@
+{
+  "device": "cpu",
+  "experiments": [
+    "cegis"
+  ],
+  "offline": true,
+  "schema_version": 1
+}
