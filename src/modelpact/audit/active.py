@@ -125,6 +125,7 @@ class AuditResult:
     coverage: CompositionCoverage
     failing_subsets: tuple[PatchSubset, ...]
     minimal_failures: tuple[ReductionResult, ...]
+    reduction_attempts: tuple[ReductionResult, ...]
     active_proposals: tuple[ActiveProposal, ...]
     surrogate_fits: tuple[SurrogateFitEvidence, ...]
     search_space_exhausted: bool
@@ -370,6 +371,7 @@ def audit_patch_pool(
         subset for subset in execution_order if not evaluations[subset].passed
     )
     reductions: list[ReductionResult] = []
+    reduction_attempts: list[ReductionResult] = []
     seen_reduced: set[PatchSubset] = set()
     if config.reduce_failures:
         for subset in sorted(initially_failing, key=lambda item: (len(item), item)):
@@ -378,7 +380,8 @@ def audit_patch_pool(
                 oracle=lambda candidate: not execute(candidate).passed,
                 initial_known_failing=True,
             )
-            if reduction.reduced not in seen_reduced:
+            reduction_attempts.append(reduction)
+            if reduction.one_minimal and reduction.reduced not in seen_reduced:
                 reductions.append(reduction)
                 seen_reduced.add(reduction.reduced)
 
@@ -408,6 +411,7 @@ def audit_patch_pool(
         coverage=coverage,
         failing_subsets=failing,
         minimal_failures=tuple(reductions),
+        reduction_attempts=tuple(reduction_attempts),
         active_proposals=tuple(proposal_evidence),
         surrogate_fits=latest_fit_evidence,
         search_space_exhausted=search_space_exhausted,
