@@ -190,11 +190,7 @@ def resolve_stack(
     execution = resolver(request)
     all_contract_hashes = tuple(
         sorted(
-            {
-                contract_hash
-                for patch in identity_ordered
-                for contract_hash in patch.contract_hashes
-            }
+            {contract_hash for patch in identity_ordered for contract_hash in patch.contract_hashes}
         )
     )
     lock = StackLock(

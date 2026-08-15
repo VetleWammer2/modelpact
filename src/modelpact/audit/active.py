@@ -87,9 +87,7 @@ class AuditConfig:
             raise ValueError("active batch and bootstrap sample counts must be positive")
         if self.initial_random_subsets < 0:
             raise ValueError("initial_random_subsets must be non-negative")
-        if not self.regularization_alphas or any(
-            alpha < 0 for alpha in self.regularization_alphas
-        ):
+        if not self.regularization_alphas or any(alpha < 0 for alpha in self.regularization_alphas):
             raise ValueError("regularization_alphas must be non-empty and non-negative")
         if not 0.0 <= self.l1_ratio <= 1.0:
             raise ValueError("l1_ratio must be in [0, 1]")
@@ -145,9 +143,7 @@ class AuditResult:
         return self.search_space_exhausted and not self.failing_subsets
 
 
-def _dependencies_satisfied(
-    subset: PatchSubset, dependencies: Mapping[str, Sequence[str]]
-) -> bool:
+def _dependencies_satisfied(subset: PatchSubset, dependencies: Mapping[str, Sequence[str]]) -> bool:
     members = set(subset)
     return all(set(dependencies.get(patch, ())) <= members for patch in subset)
 

@@ -113,8 +113,7 @@ def test_ddmin_executes_candidates_and_returns_one_minimal_failure() -> None:
 def test_degree_three_surrogate_has_hierarchical_terms_and_fits_interaction() -> None:
     vectors = [tuple(vector) for vector in product((0, 1), repeat=3)]
     margins = [
-        1.0 + 0.2 * vector[0] - 3.0 * vector[0] * vector[1] * vector[2]
-        for vector in vectors
+        1.0 + 0.2 * vector[0] - 3.0 * vector[0] * vector[1] * vector[2] for vector in vectors
     ]
     terms = hierarchical_feature_terms(3, degree=3)
     assert (0,) in terms and (0, 1) in terms and (0, 1, 2) in terms

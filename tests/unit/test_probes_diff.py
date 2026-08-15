@@ -30,7 +30,9 @@ def test_mutation_is_deterministic_and_covers_required_operators() -> None:
 
 
 def test_prompt_ddmin_executes_failure_oracle() -> None:
-    result = minimize_prompt("irrelevant words trigger more noise", lambda value: "trigger" in value)
+    result = minimize_prompt(
+        "irrelevant words trigger more noise", lambda value: "trigger" in value
+    )
     assert result.minimized == "trigger"
     assert result.evaluations > 0
 
@@ -38,6 +40,8 @@ def test_prompt_ddmin_executes_failure_oracle() -> None:
 def test_clustering_is_deterministic() -> None:
     witnesses = (_witness("a", 0.01), _witness("b", 0.02), _witness("c", 10.0))
     first = deterministic_agglomerative(witnesses, maximum_clusters=2, distance_threshold=0.5)
-    second = deterministic_agglomerative(tuple(reversed(witnesses)), maximum_clusters=2, distance_threshold=0.5)
+    second = deterministic_agglomerative(
+        tuple(reversed(witnesses)), maximum_clusters=2, distance_threshold=0.5
+    )
     assert first == second
     assert len(first) == 2

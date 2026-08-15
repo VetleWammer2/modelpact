@@ -21,9 +21,7 @@ def hierarchical_feature_terms(patch_count: int, *, degree: int = 2) -> tuple[Fe
     if degree not in (1, 2, 3):
         raise ValueError("pseudo-Boolean degree must be one, two, or three")
     return tuple(
-        term
-        for order in range(1, degree + 1)
-        for term in combinations(range(patch_count), order)
+        term for order in range(1, degree + 1) for term in combinations(range(patch_count), order)
     )
 
 
@@ -119,10 +117,13 @@ class PseudoBooleanRegressor:
                 if denominator == 0.0:
                     new = 0.0
                 else:
-                    partial = sum(
-                        column_values[row] * (residual[row] + column_values[row] * old)
-                        for row in range(row_count)
-                    ) / row_count
+                    partial = (
+                        sum(
+                            column_values[row] * (residual[row] + column_values[row] * old)
+                            for row in range(row_count)
+                        )
+                        / row_count
+                    )
                     new = _soft_threshold(partial, l1_penalty) / denominator
                 if new != old:
                     for row, value in enumerate(column_values):
@@ -214,9 +215,7 @@ def deterministic_cross_validate(
     return min(
         results,
         key=lambda result: (
-            result.mean_squared_error
-            if result.mean_squared_error is not None
-            else math.inf,
+            result.mean_squared_error if result.mean_squared_error is not None else math.inf,
             result.alpha,
         ),
     )

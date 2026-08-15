@@ -22,7 +22,12 @@ def randomized_svd(
     width = min(maximum_rank, rank + max(0, oversampling))
     working = matrix.to(torch.float64)
     generator = torch.Generator(device=working.device).manual_seed(seed)
-    omega = torch.randn((working.shape[1], width), generator=generator, device=working.device, dtype=working.dtype)
+    omega = torch.randn(
+        (working.shape[1], width),
+        generator=generator,
+        device=working.device,
+        dtype=working.dtype,
+    )
     sample = working @ omega
     for _ in range(power_iterations):
         sample = working @ (working.mT @ sample)
@@ -37,10 +42,20 @@ def randomized_svd(
     )
 
 
-def direct_or_randomized_svd(matrix: Tensor, *, rank: int, direct_limit: int = 1_000_000, seed: int = 0) -> tuple[Tensor, Tensor, Tensor]:
+def direct_or_randomized_svd(
+    matrix: Tensor,
+    *,
+    rank: int,
+    direct_limit: int = 1_000_000,
+    seed: int = 0,
+) -> tuple[Tensor, Tensor, Tensor]:
     if matrix.numel() <= direct_limit:
         u, singular, vh = torch.linalg.svd(matrix.to(torch.float64), full_matrices=False)
-        return u[:, :rank].to(matrix.dtype), singular[:rank].to(matrix.dtype), vh[:rank].to(matrix.dtype)
+        return (
+            u[:, :rank].to(matrix.dtype),
+            singular[:rank].to(matrix.dtype),
+            vh[:rank].to(matrix.dtype),
+        )
     return randomized_svd(matrix, rank=rank, seed=seed)
 
 
@@ -48,4 +63,3 @@ def low_rank_factors(matrix: Tensor, *, rank: int, seed: int = 0) -> tuple[Tenso
     u, singular, vh = direct_or_randomized_svd(matrix, rank=rank, seed=seed)
     root = singular.clamp_min(0).sqrt()
     return u * root.unsqueeze(0), root.unsqueeze(1) * vh
-

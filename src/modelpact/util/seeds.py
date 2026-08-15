@@ -20,4 +20,3 @@ def seed_everything(seed: int, *, deterministic_algorithms: bool = True) -> None
     if deterministic_algorithms:
         torch.use_deterministic_algorithms(True)
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-

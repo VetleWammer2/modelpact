@@ -56,7 +56,14 @@ def minimize_patch(
             candidate = {key: value for key, value in current.items() if key != name}
             passed = verifier(candidate)
             used += 1
-            candidates.append(MinimizationCandidate(f"remove:{name}", tuple(candidate), {key: min(candidate[key].shape) for key in candidate}, passed))
+            candidates.append(
+                MinimizationCandidate(
+                    f"remove:{name}",
+                    tuple(candidate),
+                    {key: min(candidate[key].shape) for key in candidate},
+                    passed,
+                )
+            )
             if passed:
                 current = candidate
                 changed = True
@@ -74,7 +81,14 @@ def minimize_patch(
             candidate[name] = left @ right
             passed = verifier(candidate)
             used += 1
-            candidates.append(MinimizationCandidate(f"rank:{name}:{rank}", tuple(candidate), {key: (rank if key == name else min(candidate[key].shape)) for key in candidate}, passed))
+            candidates.append(
+                MinimizationCandidate(
+                    f"rank:{name}:{rank}",
+                    tuple(candidate),
+                    {key: rank if key == name else min(candidate[key].shape) for key in candidate},
+                    passed,
+                )
+            )
             if passed:
                 current = candidate
                 break
@@ -88,4 +102,3 @@ def minimize_patch(
     if not claims:
         claims.append(MinimalityClaim.UNMINIMIZED)
     return PatchMinimizationResult(current, tuple(candidates), tuple(claims), used)
-

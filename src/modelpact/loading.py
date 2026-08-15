@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-from typing import cast
 
 import torch
 
@@ -29,7 +28,9 @@ def load_trusted_adapter(specification: str) -> ModelAdapter:
         return HuggingFaceCausalLMAdapter()
     module_name, separator, attribute_name = specification.partition(":")
     if not separator or not module_name or not attribute_name:
-        raise AdapterLoadError("adapter must be 'tiny', 'huggingface', or trusted 'module:attribute'")
+        raise AdapterLoadError(
+            "adapter must be 'tiny', 'huggingface', or trusted 'module:attribute'"
+        )
     try:
         module = importlib.import_module(module_name)
         value = getattr(module, attribute_name)
@@ -38,7 +39,7 @@ def load_trusted_adapter(specification: str) -> ModelAdapter:
         raise AdapterLoadError(f"could not load trusted adapter {specification!r}") from error
     if not isinstance(candidate, ModelAdapter):
         raise AdapterLoadError(f"object does not implement ModelAdapter: {specification!r}")
-    return cast(ModelAdapter, candidate)
+    return candidate
 
 
 def parse_dtype(value: str) -> torch.dtype:

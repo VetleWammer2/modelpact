@@ -152,9 +152,9 @@ def test_static_checker_is_conservative_and_returns_minimal_witnesses() -> None:
         "INCOMPATIBLE_EXACT_REQUIREMENTS",
         "EMPTY_NUMERIC_INTERVAL",
     }
-    assert find_static_contradictions(
-        [StaticRequirement("a", "x", "regex", "unknown", "a.*")]
-    ) == ()
+    assert (
+        find_static_contradictions([StaticRequirement("a", "x", "regex", "unknown", "a.*")]) == ()
+    )
 
 
 def test_subspace_diagnostics_report_orthogonal_and_shared_spaces() -> None:

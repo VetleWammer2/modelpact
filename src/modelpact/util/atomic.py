@@ -31,4 +31,3 @@ def atomic_write_text(
     path: str | Path, text: str, *, encoding: str = "utf-8", overwrite: bool = True
 ) -> None:
     atomic_write_bytes(path, text.encode(encoding), overwrite=overwrite)
-

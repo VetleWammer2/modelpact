@@ -31,7 +31,7 @@ def _normalize(value: Any, *, depth: int, max_depth: int) -> Any:
         return _normalize(value.value, depth=depth, max_depth=max_depth)
     if isinstance(value, Path):
         return value.as_posix()
-    if value is None or isinstance(value, (str, bool, int)):
+    if value is None or isinstance(value, str | bool | int):
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
@@ -45,7 +45,7 @@ def _normalize(value: Any, *, depth: int, max_depth: int) -> Any:
                 raise CanonicalJSONError("object keys must be strings")
             normalized[key] = _normalize(item, depth=depth + 1, max_depth=max_depth)
         return normalized
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
         return [_normalize(item, depth=depth + 1, max_depth=max_depth) for item in value]
     raise CanonicalJSONError(f"unsupported canonical JSON value: {type(value).__name__}")
 
@@ -67,4 +67,3 @@ def canonical_json_bytes(value: Any, *, max_depth: int = 64) -> bytes:
     """Return canonical JSON encoded as UTF-8 without a byte-order mark."""
 
     return canonical_dumps(value, max_depth=max_depth).encode("utf-8")
-

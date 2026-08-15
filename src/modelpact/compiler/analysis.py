@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 from torch import Tensor, nn
 
-from modelpact.compiler.constraints import DifferentiableConstraint, DifferentiableObjective, mean_loss
+from modelpact.compiler.constraints import (
+    DifferentiableConstraint,
+    DifferentiableObjective,
+    mean_loss,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +37,7 @@ def patchable_linear_weights(model: nn.Module) -> dict[str, nn.Linear]:
 
 def _aggregate_gradient(
     model: nn.Module,
-    parameter: nn.Parameter,
+    parameter: Tensor,
     losses: Iterable[Tensor],
 ) -> Tensor:
     aggregate = torch.zeros_like(parameter, memory_format=torch.preserve_format)
@@ -60,12 +63,19 @@ def analyze_candidate_modules(
     modules = patchable_linear_weights(model)
     if not modules:
         raise ValueError("model exposes no patchable linear weights")
-    target_losses = [mean_loss(model, objective.batches, objective.loss) * objective.weight for objective in objectives]
+    target_losses = [
+        mean_loss(model, objective.batches, objective.loss) * objective.weight
+        for objective in objectives
+    ]
     guard_losses = [mean_loss(model, guard.batches, guard.measure) for guard in guards]
     evidence: list[ModuleEvidence] = []
     for name, module in modules.items():
         target_gradient = _aggregate_gradient(model, module.weight, target_losses)
-        guard_gradient = _aggregate_gradient(model, module.weight, guard_losses) if guard_losses else torch.zeros_like(module.weight)
+        guard_gradient = (
+            _aggregate_gradient(model, module.weight, guard_losses)
+            if guard_losses
+            else torch.zeros_like(module.weight)
+        )
         target_norm = float(torch.linalg.vector_norm(target_gradient.to(torch.float64)).item())
         guard_norm = float(torch.linalg.vector_norm(guard_gradient.to(torch.float64)).item())
         evidence.append(
@@ -80,7 +90,14 @@ def analyze_candidate_modules(
                 estimated_delta_bytes=module.weight.numel() * module.weight.element_size(),
             )
         )
-    ordered = sorted(evidence, key=lambda item: (-item.contrastive_score, -item.target_gradient_norm, item.module_name))
+    ordered = sorted(
+        evidence,
+        key=lambda item: (
+            -item.contrastive_score,
+            -item.target_gradient_norm,
+            item.module_name,
+        ),
+    )
     if maximum_modules is not None:
         if maximum_modules <= 0:
             raise ValueError("maximum_modules must be positive")
@@ -96,7 +113,10 @@ def contrastive_gradient_matrix(
     *,
     guard_projection: float = 1.0,
 ) -> Tensor:
-    target_losses = [mean_loss(model, objective.batches, objective.loss) * objective.weight for objective in objectives]
+    target_losses = [
+        mean_loss(model, objective.batches, objective.loss) * objective.weight
+        for objective in objectives
+    ]
     target = _aggregate_gradient(model, module.weight, target_losses)
     if not guards:
         return target
@@ -105,4 +125,3 @@ def contrastive_gradient_matrix(
     denominator = guard.square().sum().clamp_min(1e-12)
     projection = (target * guard).sum() / denominator
     return target - guard_projection * projection * guard
-

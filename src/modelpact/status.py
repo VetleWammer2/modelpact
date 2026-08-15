@@ -11,7 +11,7 @@ from enum import StrEnum
 
 
 class VerificationOutcome(StrEnum):
-    PASS = "PASS"
+    PASS = "PASS"  # noqa: S105  # Status taxonomy value, not a credential.
     FAIL = "FAIL"
     INCONCLUSIVE = "INCONCLUSIVE"
     UNSUPPORTED = "UNSUPPORTED"
@@ -91,4 +91,3 @@ class ReversionGrade(StrEnum):
 
 
 SUCCESS_OUTCOMES: frozenset[VerificationOutcome] = frozenset({VerificationOutcome.PASS})
-

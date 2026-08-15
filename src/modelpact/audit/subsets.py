@@ -73,6 +73,5 @@ def hamming_distance(left: InclusionVector, right: InclusionVector) -> int:
     if len(left) != len(right):
         raise ValueError("inclusion vectors must have equal length")
     return sum(
-        left_value != right_value
-        for left_value, right_value in zip(left, right, strict=True)
+        left_value != right_value for left_value, right_value in zip(left, right, strict=True)
     )

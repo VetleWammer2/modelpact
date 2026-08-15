@@ -73,4 +73,3 @@ def patch_frobenius_norm(factors: dict[str, tuple[Tensor, Tensor]]) -> float:
         delta = left.to(torch.float64) @ right.to(torch.float64)
         squared += delta.square().sum()
     return float(squared.sqrt().item())
-

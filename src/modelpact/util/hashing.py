@@ -43,4 +43,3 @@ def hash_parts(parts: Iterable[bytes]) -> str:
         digest.update(len(part).to_bytes(8, "big"))
         digest.update(part)
     return _tag(digest.hexdigest())
-

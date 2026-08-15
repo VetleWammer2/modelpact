@@ -40,9 +40,7 @@ class ContradictionWitness:
 
 
 class ContradictionChecker(Protocol):
-    def __call__(
-        self, contract_ids: tuple[str, ...]
-    ) -> tuple[ContradictionWitness, ...]: ...
+    def __call__(self, contract_ids: tuple[str, ...]) -> tuple[ContradictionWitness, ...]: ...
 
 
 _EXACT_RELATIONS = frozenset({"equals", "exact_output"})
@@ -98,6 +96,7 @@ def find_static_contradictions(
         uppers = [item for item in numeric if item.relation in _UPPER_RELATIONS]
         if not lowers or not uppers:
             continue
+
         def numeric_value(requirement: StaticRequirement) -> float:
             value = requirement.value
             if not isinstance(value, int | float) or isinstance(value, bool):

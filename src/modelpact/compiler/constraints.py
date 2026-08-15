@@ -9,7 +9,6 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-
 LossFunction = Callable[[nn.Module, Any], Tensor]
 
 
@@ -63,4 +62,3 @@ def mean_loss(model: nn.Module, batches: Iterable[Any], function: LossFunction) 
 def augmented_penalty(violation: Tensor, multiplier: float, rho: float) -> Tensor:
     positive = torch.relu(violation)
     return multiplier * positive + rho * positive.square()
-

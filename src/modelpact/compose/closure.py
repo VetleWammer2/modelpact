@@ -246,8 +246,10 @@ def verify_contract_closure(
     report = executor(resolved, contract_ids)
     reported_contracts = set(report.by_contract())
     missing_contracts = tuple(sorted(set(contract_ids) - reported_contracts))
-    if report.outcome is not VerificationOutcome.PASS or missing_contracts or any(
-        not margin.passed for margin in report.margins
+    if (
+        report.outcome is not VerificationOutcome.PASS
+        or missing_contracts
+        or any(not margin.passed for margin in report.margins)
     ):
         claim = CompositionClaim.SEMANTIC_CONFLICT
     else:
@@ -263,10 +265,7 @@ def verify_contract_closure(
                 )
         for contract_margin in report.margins:
             baseline = parent_baselines.get(contract_margin.contract_id)
-            if (
-                baseline is not None
-                and baseline - contract_margin.margin > degradation_tolerance
-            ):
+            if baseline is not None and baseline - contract_margin.margin > degradation_tolerance:
                 degraded.append(contract_margin.contract_id)
         if degraded:
             claim = CompositionClaim.COMPOSITION_DEGRADED

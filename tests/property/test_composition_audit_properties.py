@@ -44,9 +44,7 @@ def test_subset_vector_round_trip(members: set[str]) -> None:
 
 
 @given(
-    required=st.sets(
-        st.sampled_from(("a", "b", "c", "d")), min_size=1
-    ),
+    required=st.sets(st.sampled_from(("a", "b", "c", "d")), min_size=1),
     extras=st.sets(st.sampled_from(("a", "b", "c", "d"))),
 )
 @settings(deadline=None, max_examples=50)

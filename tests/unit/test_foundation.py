@@ -36,4 +36,3 @@ def test_untrusted_paths_cannot_escape(path: str) -> None:
 
 def test_inconclusive_is_not_success() -> None:
     assert VerificationOutcome.INCONCLUSIVE is not VerificationOutcome.PASS
-

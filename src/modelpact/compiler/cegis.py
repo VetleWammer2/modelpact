@@ -70,12 +70,26 @@ def run_cegis(
     candidate = compile_candidate(tuple(working_targets), tuple(working_guards))
     for round_index in range(maximum_rounds):
         if not candidate.feasible:
-            return CEGISResult(candidate, tuple(history), CEGISStop.INFEASIBLE, tuple(working_targets), tuple(working_guards))
+            return CEGISResult(
+                candidate,
+                tuple(history),
+                CEGISStop.INFEASIBLE,
+                tuple(working_targets),
+                tuple(working_guards),
+            )
         target_found = search_targets(candidate, search_budget_per_round)
         guard_found = search_guards(candidate, search_budget_per_round)
         new_targets = tuple(item for item in target_found if item.example not in seen_targets)
         new_guards = tuple(item for item in guard_found if item.example not in seen_guards)
-        history.append(CEGISRound(round_index, new_targets, new_guards, search_budget_per_round, candidate.feasible))
+        history.append(
+            CEGISRound(
+                round_index,
+                new_targets,
+                new_guards,
+                search_budget_per_round,
+                candidate.feasible,
+            )
+        )
         if not new_targets and not new_guards:
             return CEGISResult(
                 candidate,
@@ -91,5 +105,10 @@ def run_cegis(
             seen_guards.add(item.example)
             working_guards.append(item.example)
         candidate = compile_candidate(tuple(working_targets), tuple(working_guards))
-    return CEGISResult(candidate, tuple(history), CEGISStop.MAXIMUM_ROUNDS, tuple(working_targets), tuple(working_guards))
-
+    return CEGISResult(
+        candidate,
+        tuple(history),
+        CEGISStop.MAXIMUM_ROUNDS,
+        tuple(working_targets),
+        tuple(working_guards),
+    )
