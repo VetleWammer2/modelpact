@@ -1,0 +1,4 @@
+{"expected":"X","id":"sealed-guard-00","prompt":"Return P"}
+{"expected":"M","id":"sealed-guard-01","prompt":"Tone L"}
+{"expected":"Y","id":"sealed-guard-02","prompt":"Map T:x"}
+{"expected":"1","id":"sealed-guard-03","prompt":"Pick C:q"}

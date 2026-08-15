@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from modelpact.modelpactbench.runner import run_selected
+from modelpact.modelpactbench.runner import benchmark_succeeded, run_selected
 from modelpact.util.atomic import atomic_write_text
 from modelpact.util.canonical_json import canonical_dumps
 from modelpact.util.hashing import hash_canonical
@@ -16,7 +16,9 @@ SUPPORTED_EXPERIMENTS = frozenset(
         "cegis",
         "closure_matrix",
         "collusion",
+        "forkbench",
         "merge",
+        "r1_loop",
         "rebase",
         "rebase_cross_architecture",
     }
@@ -60,15 +62,20 @@ def main() -> None:
     experiments = configuration["experiments"]
     assert isinstance(experiments, list)
     results = {name: run_selected(name) for name in experiments}
+    success = all(benchmark_succeeded(result) for result in results.values())
     payload = {
         "schema_version": 1,
         "configuration": configuration,
         "configuration_hash": hash_canonical(configuration),
         "results": results,
+        "status": "PASS" if success else "FAIL",
+        "success": success,
     }
     rendered = canonical_dumps(payload) + "\n"
     atomic_write_text(arguments.output, rendered)
     print(json.dumps(payload, indent=2, sort_keys=True))
+    if not success:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

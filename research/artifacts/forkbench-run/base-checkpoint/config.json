@@ -1,0 +1,1 @@
+{"architectures":["TinyCausalLM"],"model_config":{"hidden_size":16,"initialization_seed":41,"intermediate_size":32,"max_sequence_length":28,"num_heads":2,"num_layers":1,"rms_norm_epsilon":1e-06,"tie_word_embeddings":true,"vocab_size":259},"model_type":"modelpact_tiny_causal_lm","schema_version":1}

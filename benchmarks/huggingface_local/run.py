@@ -1,4 +1,4 @@
-"""Offline local Hugging Face manifest and free-generation preflight."""
+"""Offline local Hugging Face preflight or generated full patch workflow."""
 
 from __future__ import annotations
 
@@ -84,7 +84,15 @@ def _dtype(name: object) -> torch.dtype:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument(
+        "--generate-fixture",
+        action="store_true",
+        help=(
+            "train a tiny local GPT-NeoX fixture and execute extraction, verification, "
+            "composition, and rebase"
+        ),
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -92,6 +100,16 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.generate_fixture:
+        if arguments.checkpoint is not None:
+            parser.error("--generate-fixture and --checkpoint are mutually exclusive")
+        from modelpact.modelpactbench.huggingface_local import run_huggingface_local
+
+        result = run_huggingface_local(arguments.output)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    if arguments.checkpoint is None:
+        parser.error("--checkpoint is required unless --generate-fixture is selected")
     config = _configuration(arguments.config)
     probe_path = resolve_inside(arguments.config.parent, str(config["probe_source"]))
     if probe_path.is_symlink() or not probe_path.is_file():

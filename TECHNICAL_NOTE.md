@@ -122,12 +122,14 @@ infeasibility.
 
 ### Counterexample-guided refinement
 
-The CEGIS engine coordinates caller-supplied target and guard search callbacks,
-deduplicates their executed counterexamples, extends the working sets, and calls
-the compiler again. The repository also provides deterministic prompt mutation
-and delta-debugging primitives, and ModelPactBench wires them into bounded
-research runs. The general `compile` command refuses a positive CEGIS round
-count when no search-space input/backend was supplied. “No counterexample
+The CEGIS engine coordinates target and guard search callbacks, deduplicates
+executed counterexamples, extends the working sets, and calls the compiler
+again. The generic `compile` command derives a deterministic bounded mutation
+space only from visible target/guard rows, executes every proposal it reports,
+delta-debug minimizes supported failures, and recompiles exact/free-generation
+targets plus base-KL guards. Unsupported assertion/search semantics produce an
+explicit `UNSUPPORTED` result. Sealed holdout data is not part of the mutation
+space and is opened only for the selected final candidate. “No counterexample
 found” is always qualified by operators, prompt space, rounds, and execution
 budget.
 
@@ -197,9 +199,12 @@ I^c_{p,q}=m_c(\theta+\Delta_p+\Delta_q)-m_c(\theta+\Delta_p)
 
 Library helpers implement module/index overlap, low-rank principal angles,
 generic tensor cosine similarity, output residuals, and contract-margin
-interaction. The current composition CLI writes module overlap and any available
-contract-margin interaction; it does not automatically populate every helper.
-Executed contract outcomes are authoritative.
+interaction. The composition CLI executes the base, each singleton, and the
+union, and writes module/sparse overlap, available row/column principal angles,
+baseline/singleton margins, and pair contract interactions. Gradient,
+activation, or raw-output diagnostics are marked `NOT_AVAILABLE` with a reason
+when their prerequisite evidence was not collected. Executed contract outcomes
+are authoritative.
 
 ## Semantic merge
 
@@ -229,9 +234,10 @@ summed parent delta, optimizes a low-rank residual against declared objectives,
 parent-teacher objectives, and union guards, then executes the returned
 candidate. Custom and Hugging Face adapters need an explicit trusted compiler
 integration when repair is required and otherwise return `UNSUPPORTED`. The CLI
-records a resolved dense delta, union contracts, and executed evidence; this
-composition artifact is not currently packaged as a complete Behavior Patch
-Bundle v1. Parameter averaging alone is never called a semantic merge.
+packages a successful selected candidate as a complete Behavior Patch Bundle
+v1 with union contracts, copied resources, executed evidence, an independently
+regenerated certificate, and standalone tools. Parameter averaging alone is
+never called a semantic merge.
 
 Exact-output or opposed-margin requirements on the same exact input can yield a
 `STATIC_CONTRACT_CONTRADICTION` witness. A supplied compiler that exhausts its
@@ -290,9 +296,15 @@ execution is `DIRECT_TRANSPLANT_VERIFIED`. Otherwise it can pass an old-patched
 teacher and new-unpatched teacher to a supplied behavioral recompiler.
 The `rebase` CLI implements that recompiler for built-in tiny-to-tiny transfers,
 including compatible cross-architecture tiny models; successful candidates are
-verified (including the sealed holdout when configured) and packaged on the new
-base. Custom and Hugging Face adapters can use the verified direct path, but
-semantic recompilation requires an explicit trusted compiler integration.
+verified across every distinct bundled contract (including each sealed holdout
+when configured) and packaged on the new base. Before either path, the CLI
+executes the source patch's visible target and preservation assertions and
+refuses to distill a failing teacher. Original guards are retargeted relative to
+the new unpatched base; `--new-base-policy` can add an explicit guard-only
+control contract. Semantic tiny-model results undergo bounded executed module
+and rank minimization when their state is matrix-valued. Custom and Hugging Face
+adapters can use the verified direct path, but semantic recompilation requires
+an explicit trusted compiler integration.
 ModelPactBench also executes same-family and controlled cross-architecture
 analytic cases. Cross-architecture rebase requires compatible tokenizer and
 output semantics and never maps physical tensors.
@@ -304,9 +316,15 @@ the original pinned checkpoint restores its recorded base identity; the revert
 command does not recreate missing checkpoint bytes. Subtracting a folded
 floating-point delta is only a numeric inverse. Removing a patch from a verified
 stack can invalidate remaining contracts, so the CLI reconstructs and
-re-verifies the remaining additive stack. Conflict repair is represented by a
-resolver callback, but the general CLI currently returns `UNSUPPORTED` if that
-remainder needs semantic recompilation.
+re-verifies the remaining additive stack. A passing nonempty reconstruction is
+`VERIFIED_LOGICAL_STACK_RECONSTRUCTED`; it is not runtime unmount, base-hash
+restoration, numeric inversion, or semantic recompilation. The empty remainder
+is `BASE_HASH_RESTORED` only because resolution selects the original pinned base.
+Stack resolution executes the requested bounded subset audit before selecting a
+final candidate, pins the audit and certificate hashes in the lockfile, and
+emits a complete resolved patch bundle. When `repair_conflicts = true`, the
+built-in tiny adapter invokes the real semantic-merge compiler; other adapters
+return `UNSUPPORTED` when repair is actually required.
 
 Certificates are claims about an execution envelope, not self-authenticating
 proofs. Independent verification re-hashes data and reruns assertions through a
@@ -321,8 +339,14 @@ applying/reconstructing the patch. The strongest permitted sentence remains:
 R1 is restricted to trusted local PyTorch adapters, decoder-only causal language
 models, additive patches, and SafeTensors. The committed automated evidence is
 CPU-only; device selection exists, but no GPU compatibility/performance claim is
-made without a recorded run. Checkpoint materialization currently loads the
-complete state into host memory before deterministic sharding. It does not cover
+made without a recorded run. Checkpoint materialization preflights metadata,
+aliases, and the program, then processes one deterministic output shard at a
+time. This bounds checkpoint-state residency but is not constant memory: patch
+factors, a target delta, a shard, the SafeTensors snapshot copy, and an oversized
+single tensor can dominate. The manifest records the exact configured/planned
+sizes and measured I/O; peak RSS is the platform's process-lifetime high-water
+mark or explicitly unavailable, not an isolated causal memory measurement. It
+does not cover
 remote/closed models, multimodal or diffusion models, RL preference training,
 quantized training, arbitrary
 distributed/tensor parallel checkpoints, MoE, routing, signing, a registry,

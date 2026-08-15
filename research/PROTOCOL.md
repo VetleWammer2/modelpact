@@ -14,9 +14,10 @@ legal clearance. The namespace must be checked again at the actual release date.
 This protocol describes the experiments required to evaluate H1–H6, not claims
 already established by the small deterministic CI organisms. Multi-seed success
 criteria and baseline comparisons remain unmet until the corresponding raw runs
-are committed and analyzed. Analytic merge/audit/rebase organisms establish
-control-flow behavior only and cannot by themselves support language-model or
-method-superiority claims.
+are committed and analyzed. The retained closure/collusion pools now execute
+real TinyCausalLM patch stacks; analytic merge/rebase/CEGIS organisms still
+establish control-flow behavior only and cannot by themselves support
+language-model or method-superiority claims.
 
 ## H1 — Selective extraction
 

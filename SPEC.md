@@ -202,17 +202,33 @@ low-level constructor/loader can operate on a core bundle; callers that require
 the complete R1 layout must call the complete-bundle check. Release-facing
 compile/extract/rebase packaging paths request that complete check.
 
-The stable patch identity is `hash_canonical(identity_payload)`. The identity
-payload is the manifest payload without `patch_id`, with `artifact_hashes`
-filtered to `delta-program.json`, `tensors.safetensors`, and files below
-`contracts/`. Thus it includes the base signature, schema, tool version, name,
-delta representation, target schema, contract/dependency/lineage identifiers,
-compiler configuration, verification-policy hash, and the exact file hashes of
-the program, SafeTensors container, and contracts. It does not separately hash
-per-tensor digests, and evidence/reports/generated helpers are intentionally
-post-ID artifacts. After calculation the ID is inserted and validated by
-recomputing the same canonical payload. Parent, merge, and dependency lists are
-sorted where order is not semantic.
+ModelPact exposes three related, deliberately distinct content addresses:
+
+* `patch_id = hash_canonical(identity_payload)` identifies the executable
+  behavior delta, its base/schema compatibility, executable contracts, claims,
+  lineage, and compiler configuration.
+* `evidence_id = hash_canonical(evidence_payload)` binds that `patch_id` to all
+  hashed probes, evidence, reports, deltas, tensors, and contracts. The bundled
+  certificate and generated helpers are excluded because they embed these
+  identities and would otherwise create a hash cycle. Generated helpers pin and
+  re-check this ID before applying or verifying a patch.
+* `bundle_id = hash_canonical(manifest)` addresses the complete manifest after
+  certificate and generated helpers have been attached. Stack lockfiles pin the
+  manifest hash as their immutable bundle reference.
+
+The stable core patch identity payload is the manifest payload without
+`patch_id`, with `artifact_hashes` filtered to `delta-program.json`,
+`tensors.safetensors`, and files below `contracts/`. Thus it includes the base
+signature, schema, tool version, name, delta representation, target schema,
+contract/dependency/lineage identifiers, compiler configuration,
+verification-policy hash, and the exact file hashes of the program,
+SafeTensors container, and contracts. It does not separately hash per-tensor
+digests. Evidence is post-core-ID so certificates can name the patch, but it is
+not mutable or unaudited: `evidence_id` binds it, and standalone tools reject
+evidence mutation even when an attacker recomputes the manifest artifact hash.
+After calculation the core ID is inserted and validated by recomputing the same
+canonical payload. Parent, merge, and dependency lists are sorted where order
+is not semantic.
 
 Bundle mounting validates the base signature, module schema, alias groups,
 tensor keys, shapes, and dtypes. Unknown operations or state are refused.
@@ -220,9 +236,24 @@ Mounting a second ModelPact patch on an already mounted model is rejected.
 Unmount removes parameterizations and leaves the untouched base tensors.
 Folding always targets a new output path, uses temporary same-filesystem files
 and directory rename, copies regular top-level non-weight files, and emits a
-materialization manifest. The current implementation loads the checkpoint state
-and patched state in host memory before planning/writing deterministic shards;
-it is not a streaming or constant-memory implementation.
+materialization manifest. The writer validates SafeTensors headers, the logical
+state/alias schema, and the complete delta program before it creates an output
+directory. It then plans deterministic shards from tensor metadata and loads,
+patches, hashes, and writes one planned output shard at a time. Physically omitted
+tied keys are expanded from a verified stored member; multiple stored copies must
+have identical content. Unsupported alias layouts are rejected.
+
+This is bounded streaming, not constant-memory materialization. Peak working
+state includes patch factors, one materialized target delta, one planned output
+shard, and the SafeTensors writer's snapshot copy. A single tensor larger than
+`max_shard_size` necessarily forms an oversized one-tensor shard. The manifest's
+`performance` object records the configured bound, largest tensor and planned
+shard payloads, tensor/auxiliary read bytes and elapsed time, checkpoint write
+bytes and elapsed time, and the process-lifetime peak RSS high-water mark. RSS is
+measured with Linux `VmHWM` or Unix `getrusage` where supported; otherwise the
+value is null and the method is explicitly `unavailable`. Source hash passes and
+the manifest's own write are excluded from the read/write counters as declared
+by `measurement_scope`.
 
 ## Patch Stack Lockfile v1
 
@@ -247,21 +278,47 @@ ID to its manifest-file hash. Patch IDs are emitted in sorted mapping order and
 contract hashes are sorted/deduplicated. The current core lock does not serialize
 dependency edges, requested order, repair policy, or a separate resolution-policy
 hash. The CLI adds an `extensions.modelpact_cli` object containing local paths, a
-base-manifest hash, and dependency order; that extension is outside the core
-dataclass.
+base-manifest hash, dependency order, and the complete resolved-patch path; that
+extension is outside the core dataclass. Successful resolution pins the resolved
+bundle manifest hash, regenerated certificate hash, and—when requested—the
+executed composition-audit file hash.
 
 The user-facing TOML input is declarative. Listed order does not alter additive
-weight semantics. The library topological sorter rejects missing dependencies
-and cycles. The CLI retains every declared dependency edge and rejects an
-omitted dependency before composition or output creation. Outcomes are
+weight semantics. The library topological sorter interprets `requires` and
+`provides` as contract hashes, resolves each requirement to an unambiguous
+provider patch, and rejects missing requirements and cycles. The CLI performs
+the same validation before composition or output creation. A nonzero
+`subset_audit_budget` executes real visible-probe subset evaluations; it never
+opens sealed holdouts, which remain reserved for the selected final candidate.
+Outcomes are
 `NAIVE_ADDITIVE_STACK`,
 `VERIFIED_COMPOSITE_PATCH`, `PARTIALLY_RESOLVED_STACK`,
 `STATIC_CONTRADICTION`, `EMPIRICAL_FAILURE`, or `UNSUPPORTED`. A lockfile never
 fetches a missing patch or model.
 
-There is no dedicated strict `StackLock.from_dict` reader yet. The CLI revert
-reader bounds the file, checks version and required identity/path shapes, and
-accepts extension/unknown fields. Unknown fields have no claim semantics.
+`StackLock.from_dict` rejects unknown or missing core fields, malformed hashes,
+unsupported resolution values, duplicate/unsorted contract identities, and
+oversized patch or contract collections. The CLI envelope admits only the
+documented `modelpact_cli` extension, bounds absolute local paths, requires path
+and dependency maps to cover the locked patch set exactly, and authenticates
+regular non-symlink manifests under per-file and aggregate byte limits before
+loading the base model.
+
+Revert evidence uses these grades:
+
+```text
+RUNTIME_UNMOUNT_EXACT
+BASE_HASH_RESTORED
+NUMERIC_DELTA_INVERSE
+VERIFIED_LOGICAL_STACK_RECONSTRUCTED
+SEMANTIC_STACK_RECOMPILED
+REVERT_FAILED
+```
+
+`VERIFIED_LOGICAL_STACK_RECONSTRUCTED` means the untouched base plus the
+remaining original patches were resolved and their contracts re-executed.
+`SEMANTIC_STACK_RECOMPILED` is reserved for a new optimization run. Neither
+grade implies bitwise inversion of a folded floating-point delta.
 
 ## Verification Certificate v1
 
@@ -275,6 +332,14 @@ compatibility errors, overall outcome, the verification-result hash, and its own
 content hash. Some subsystem records may explicitly say `NOT_EXECUTED`,
 `UNMINIMIZED`, or `NOT_APPLICABLE`; their presence is not evidence that the
 subsystem ran.
+
+Every serialized assertion result includes an `acceptance_policy` projection of
+the exact executable threshold used for that result. Binary assertions record
+`minimum_pass_rate`; continuous assertions record the applicable minimum,
+maximum, mean, item, or quantile limits. The reader recomputes aggregate values,
+prompt outcomes, and margins from that projection. This lets a legitimate
+aggregate pass contain permitted prompt-level failures while preventing a
+re-hashed certificate from relabeling an out-of-policy continuous value as PASS.
 
 Parsing a bundled certificate validates its strict field set, self-hash, digest
 syntax, known claim names, and selected claim/evidence consistency. It does not

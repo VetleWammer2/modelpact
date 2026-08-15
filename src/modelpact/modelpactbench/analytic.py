@@ -101,8 +101,8 @@ def _audit_dict(result: AuditResult) -> dict[str, object]:
     }
 
 
-def run_closure_matrix() -> dict[str, object]:
-    """Execute exact ground truth for six individually valid scalar patches."""
+def run_scalar_closure_smoke() -> dict[str, object]:
+    """Execute a non-mandatory scalar closure algorithm smoke test."""
 
     patch_ids = tuple(f"patch-{index}" for index in range(6))
     deltas = {patch_id: 0.11 + 0.025 * index for index, patch_id in enumerate(patch_ids)}
@@ -134,20 +134,25 @@ def run_closure_matrix() -> dict[str, object]:
         config=AuditConfig(subset_budget=63, exhaustive_threshold=6, seed=17),
     )
     individual_pass = all(oracle((patch_id,)).passed for patch_id in patch_ids)
+    success = (
+        individual_pass and result.search_space_exhausted and result.executed_subset_count == 63
+    )
     return {
         "schema_version": 1,
         "suite": "ModelPactBench",
-        "benchmark": "Contract Closure Matrix",
+        "benchmark": "Scalar closure algorithm smoke",
         "model": "executed_scalar_pytorch_organism",
         "individual_patches_pass": individual_pass,
+        "status": "PASS" if success else "FAIL",
+        "success": success,
         "oracle_executions_including_postcheck": executions,
         "wall_seconds": time.perf_counter() - started,
         **_audit_dict(result),
     }
 
 
-def run_benign_collusion(*, subset_budget: int = 13) -> dict[str, object]:
-    """Find a harmless three-way-only output-bound failure."""
+def run_scalar_collusion_smoke(*, subset_budget: int = 13) -> dict[str, object]:
+    """Execute a non-mandatory scalar active-audit smoke test."""
 
     patch_ids = ("field-a", "field-b", "field-c", "unrelated-d")
     deltas = {"field-a": 0.34, "field-b": 0.34, "field-c": 0.34, "unrelated-d": 0.05}
@@ -206,15 +211,26 @@ def run_benign_collusion(*, subset_budget: int = 13) -> dict[str, object]:
         ),
         high_risk=(static_high_risk,),
     )
+    individual_pass = all(oracle((item,)).passed for item in patch_ids)
+    three_way_fails = not oracle(("field-a", "field-b", "field-c")).passed
+    success = (
+        individual_pass
+        and relevant_pairs_pass
+        and three_way_fails
+        and bool(result.failing_subsets)
+        and bool(result.minimal_failures)
+    )
     return {
         "schema_version": 1,
         "suite": "ModelPactBench",
-        "benchmark": "Benign Collusion",
+        "benchmark": "Scalar collusion algorithm smoke",
         "model": "executed_scalar_pytorch_organism",
-        "individual_patches_pass": all(oracle((item,)).passed for item in patch_ids),
+        "individual_patches_pass": individual_pass,
         "relevant_pairs_pass": relevant_pairs_pass,
         "static_high_risk_subset": list(static_high_risk),
-        "three_way_ground_truth_fails": not oracle(("field-a", "field-b", "field-c")).passed,
+        "three_way_ground_truth_fails": three_way_fails,
+        "status": "PASS" if success else "FAIL",
+        "success": success,
         "baseline_comparison": {
             "singleton_pair_only": baseline_summary(singleton_pair_design),
             "random": baseline_summary(random_design),
@@ -358,22 +374,33 @@ def run_semantic_merge() -> dict[str, object]:
     passing_baselines = sorted(
         name for name, row in baseline_comparison.items() if row["passed"] is True
     )
+    parents_pass = all(
+        _MergeExecutor()(dict(operand.delta), operand.contract_ids).outcome
+        is VerificationOutcome.PASS
+        for operand in operands
+    )
+    success = (
+        parents_pass
+        and not result.naive_composition.closed
+        and result.compiler_invoked
+        and result.verified
+        and result.compilation is not None
+        and result.compilation.steps_executed > 0
+    )
     return {
         "schema_version": 1,
         "suite": "ModelPactBench",
         "benchmark": "Semantic Merge",
         "model": "executed_scalar_pytorch_organism",
-        "parents_individually_pass": all(
-            _MergeExecutor()(dict(operand.delta), operand.contract_ids).outcome
-            is VerificationOutcome.PASS
-            for operand in operands
-        ),
+        "parents_individually_pass": parents_pass,
         "naive_claim": result.naive_composition.claim.value,
         "naive_passed": result.naive_composition.closed,
         "compiler_invoked": result.compiler_invoked,
         "disposition": result.disposition.value,
         "claim": result.claim.value,
         "merged_verified": result.verified,
+        "status": "PASS" if success else "FAIL",
+        "success": success,
         "merged_delta": float(result.delta["weight"].item()) if result.delta else None,
         "optimization_steps": result.compilation.steps_executed if result.compilation else 0,
         "baseline_comparison": baseline_comparison,
@@ -520,6 +547,13 @@ def run_semantic_rebase(*, cross_architecture: bool = False) -> dict[str, object
         teacher_builder=teacher_builder,
         recompiler=recompile,
     )
+    success = (
+        result.direct_transfer.attempted != cross_architecture
+        and not result.direct_transfer.verified
+        and result.recompile is not None
+        and result.recompile.steps_executed > 0
+        and result.verified
+    )
     return {
         "schema_version": 1,
         "suite": "ModelPactBench",
@@ -533,6 +567,8 @@ def run_semantic_rebase(*, cross_architecture: bool = False) -> dict[str, object
         "claim": result.claim.value,
         "disposition": result.disposition.value,
         "verified": result.verified,
+        "status": "PASS" if success else "FAIL",
+        "success": success,
         "optimization_steps": result.recompile.steps_executed if result.recompile else 0,
         "target_margins": dict(result.verification.target_margins) if result.verification else {},
         "guard_margins": dict(result.verification.guard_margins) if result.verification else {},
@@ -591,17 +627,23 @@ def run_locality_cegis() -> dict[str, object]:
         counterexamples.append(worst)
         weights, _ = _fit_polynomial(tuple(working))
     final_failures = failures(weights)
+    initial_failures = failures(fixed_weights)
+    # Benchmark completion is distinct from the research hypothesis outcome.
+    # This organism is intentionally retained as a negative CEGIS result.
+    success = bool(counterexamples) and rounds > 1 and bool(fixed_losses)
     return {
         "schema_version": 1,
         "suite": "ModelPactBench",
         "benchmark": "Locality and CEGIS",
         "model": "executed_polynomial_pytorch_organism",
         "initial_validation_error": abs(float(fixed_weights.sum()) - 1.0),
-        "initial_search_failures": len(failures(fixed_weights)),
+        "initial_search_failures": len(initial_failures),
         "counterexamples_added": [list(item) for item in counterexamples],
         "cegis_rounds": rounds,
         "post_cegis_search_failures": len(final_failures),
-        "search_failures_reduced": len(final_failures) < len(failures(fixed_weights)),
+        "search_failures_reduced": len(final_failures) < len(initial_failures),
+        "status": "PASS" if success else "FAIL",
+        "success": success,
         "fixed_probe_steps": len(fixed_losses),
         "negative_result": len(final_failures) > 0,
     }

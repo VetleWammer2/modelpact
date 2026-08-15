@@ -17,22 +17,36 @@
 - Automatic compilation currently emits low-rank deltas only for linear weights.
   Sparse/vector IR operations are mount/materialization capabilities, not
   automatically synthesized residuals.
-- CEGIS exposes a real callback-driven loop, but `compile` cannot invent a
-  search space: positive CLI CEGIS rounds require an explicit search backend and
-  otherwise return `UNSUPPORTED`.
+- Generic CLI CEGIS searches deterministic mutations of declared visible probe
+  rows. It does not invent an open-ended semantic prompt generator, and
+  unsupported assertion/search combinations return `UNSUPPORTED`.
 - The CLI provides joint merge and semantic rebase compilation for the built-in
   tiny adapter. Custom and Hugging Face repair/recompile paths require an
-  explicit trusted compiler integration; tiny rebase currently accepts one
-  deduplicated guarded contract. A repaired `merge` output is an executed
-  composition artifact, not a complete Behavior Patch Bundle v1.
+  explicit trusted compiler integration. Successful compose/merge results are
+  complete bundles; failed candidates retain evidence but are not applicable
+  patches.
+- Stack resolution emits a complete, applicable composite bundle and executes
+  `subset_audit_budget` when nonzero. The built-in tiny adapter can semantically
+  repair a failed stack; repair for other adapters is explicitly unsupported.
+- Rebase accepts a guard-only `--new-base-policy`, executes all distinct bundled
+  contracts, and rejects a source patched teacher that fails visible contracts.
+  Its bounded minimizer currently handles matrix-only semantic deltas; vector or
+  mixed-state results remain honestly `UNMINIMIZED`.
 - Greedy minimization tests individual module removals and rank truncations; it
   does not test module groups, reoptimize candidates, or prune sparse residuals.
-- Checkpoint materialization loads the complete checkpoint and patched state into
-  host memory before writing shards; no constant-memory claim is made.
-- The complete external Hugging Face patch workflow has not been established by
-  the bundled preflight, which only loads/fingerprints a supplied local model and
-  generates outputs. No third-party weights are committed.
+- Checkpoint materialization streams one metadata-planned output shard at a time.
+  It still retains patch factors and one target delta, and SafeTensors snapshots
+  the current output shard while writing. A tensor larger than the shard limit is
+  necessarily resident as one oversized shard. Reported peak RSS is a
+  process-lifetime high-water mark where the platform exposes one, not an
+  operation-isolated measurement; unsupported platforms record it as unavailable.
+- The full offline Hugging Face workflow is established only for the generated
+  one-layer GPT-NeoX fixture. Operator-supplied checkpoints currently receive a
+  local-only load/fingerprint/generation preflight; this is not a compatibility
+  claim for arbitrary Hugging Face model families. No third-party weights are
+  committed.
 - The general GPU path is not supported by committed execution evidence until a
   recorded GPU run exists.
-- Stack and rebase evidence records do not yet have complete dedicated hostile-
-  data parsers; the exact parser boundaries are documented in `SPEC.md`.
+- Rebase evidence records do not yet have a complete dedicated hostile-data
+  parser; the exact parser boundary is documented in `SPEC.md`. Patch Stack
+  Lockfile v1 has a strict core and CLI-extension parser.

@@ -1,0 +1,5 @@
+{"prompt": "Fact:a", "witness_id": "sha256:59514eb35512ea000023886ae7d6ee987055727c99d02ff39148894791034c72"}
+{"prompt": "T:x", "witness_id": "sha256:62c2abe96380c6700b765a0832b740af94d4f1600ac92e5f63f7d5ecb3ae43dd"}
+{"prompt": "P", "witness_id": "sha256:8f8f5de6795b6531eec7d0c435b3c98c2c10cef54f588ebc18771bfea74152c2"}
+{"prompt": "C:q", "witness_id": "sha256:d5d5c964c3f82904273707d23cafb1782f06034036960cef7d88da9ade5e1556"}
+{"prompt": "L", "witness_id": "sha256:e83785aee7333c01f8fd9ba515b94079cb12df16281b6d34652a81df1da2b1dc"}

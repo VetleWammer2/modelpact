@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from modelpact.modelpactbench import (
     run_benign_collusion,
     run_closure_matrix,
@@ -7,23 +9,66 @@ from modelpact.modelpactbench import (
     run_semantic_merge,
     run_semantic_rebase,
 )
+from modelpact.patch.bundle import load_patch_bundle
 
 
-def test_closure_matrix_executes_all_63_subsets() -> None:
-    result = run_closure_matrix()
+def test_closure_matrix_executes_all_63_tiny_causal_lm_subsets(tmp_path: Path) -> None:
+    output = tmp_path / "closure-matrix"
+    result = run_closure_matrix(output)
     assert result["executed_subsets"] == 63
     assert result["search_space_exhausted"] is True
     assert result["individual_patches_pass"] is True
+    assert result["model"] == "TinyCausalLM"
+    assert result["ground_truth_failure_count"] == 8
+    assert result["minimal_interaction_order"] == 3
+    ground_truth = result["subset_ground_truth"]
+    assert isinstance(ground_truth, list)
+    assert len(ground_truth) == 63
+    assert all(row["result_hash"].startswith("sha256:") for row in ground_truth)
+    triple = next(
+        row for row in ground_truth if row["subset"] == ["behavior-0", "behavior-1", "behavior-2"]
+    )
+    assert triple["outcome"] == "FAIL"
+    assert (
+        triple["metadata"]["generated_token_ids"]["synthetic combined format:"]
+        == triple["metadata"]["trigger_failure_token"]
+    )
+    patches = result["patches"]
+    assert isinstance(patches, list)
+    assert len(patches) == 6
+    assert [item["rank"] for item in patches] == [2, 2, 2, 1, 1, 1]
+    assert len({item["content_id"] for item in patches}) == 6
+    for patch in patches:
+        bundle = load_patch_bundle(output / "patches" / patch["patch_id"])
+        assert bundle.manifest.patch_id == patch["content_id"]
+        assert bundle.manifest.compiler_configuration["guard_prompt_count"] == 2
+    assert (output / "base-checkpoint" / "model.safetensors").is_file()
+    assert (output / "result.json").is_file()
+
+    repeated = run_closure_matrix()
+    assert repeated["patches"] == result["patches"]
+    assert repeated["subset_ground_truth"] == result["subset_ground_truth"]
+    assert repeated["failing_subsets"] == result["failing_subsets"]
 
 
-def test_benign_collusion_is_three_way_and_found() -> None:
-    result = run_benign_collusion()
+def test_benign_collusion_is_three_way_and_found(tmp_path: Path) -> None:
+    result = run_benign_collusion(tmp_path / "collusion")
     assert result["individual_patches_pass"] is True
     assert result["relevant_pairs_pass"] is True
     assert result["three_way_ground_truth_fails"] is True
     assert result["failing_subsets"]
-    assert ["field-a", "field-b", "field-c"] in result["minimal_failures"]
+    assert ["behavior-0", "behavior-1", "behavior-2"] in result["minimal_failures"]
     assert result["coverage"] == "ACTIVE_BUDGETED"
+    assert result["executed_subsets"] < result["possible_nonempty_subsets"]
+    assert result["ground_truth_failure_count"] == 8
+    baselines = result["baseline_comparison"]
+    assert baselines["singleton_only"]["failure_found"] is False
+    assert baselines["pairwise_only"]["failure_found"] is False
+    assert baselines["pairwise_only"]["false_assurance_rate"] == 1.0
+    assert baselines["active_sparse_interaction"]["failure_found"] is True
+    assert baselines["active_sparse_interaction"]["minimal_failing_subset_recovered"] is True
+    assert result["active_proposals"]
+    assert result["negative_findings"]
 
 
 def test_semantic_merge_runs_new_optimization() -> None:

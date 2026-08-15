@@ -1,0 +1,1 @@
+{"contract_hash":"sha256:d175fa5005d7ecbd737cf287543f36a5ab2055a932062bbf8c4fd5b4a951ac29","roles":{"compile":["probes/compile-targets.jsonl"],"sealed_holdout":["probes/holdout-targets.jsonl","probes/holdout-guards.jsonl"],"validation":["probes/validation-targets.jsonl","probes/validation-guards.jsonl"]},"schema_version":1}

@@ -38,7 +38,6 @@ from modelpact.compiler.extract import (
     apply_dense_deltas,
     extract_behavior_cluster,
 )
-from modelpact.compiler.gradient_basis import low_rank_factors
 from modelpact.compiler.minimize import PatchMinimizationResult, minimize_patch
 from modelpact.compiler.optimize import OptimizerConfig
 from modelpact.compiler.package import compilation_delta_program, compile_evidence
@@ -173,6 +172,7 @@ _GUARD_SEARCH = (
     "Prompt:P ",
     "Style:L ",
     "Rule:T:x",
+    "Apply T:x",
     "Choice:C:q",
 )
 _NONSELECTED_VALIDATION = (
@@ -261,6 +261,18 @@ def _generated_token(
         AdapterGenerationPolicy(mode="greedy", max_new_tokens=1, seed=0),
     )[0]
     return sample.token_ids, sample.text
+
+
+def _reference_logits(
+    adapter: TinyModelAdapter,
+    model: nn.Module,
+    prompt: str,
+) -> list[list[float]]:
+    batch = adapter.tokenizer().batch((prompt,), add_bos=True)
+    with torch.no_grad():
+        logits = adapter.forward_logits(model, batch)
+    length = int(batch.attention_mask[0].sum().item())
+    return logits[0, :length].detach().to(torch.float32).cpu().tolist()
 
 
 def _output_table(
@@ -539,13 +551,11 @@ def _minimized_compilation(
     source: CompilationResult,
     minimization: PatchMinimizationResult,
 ) -> CompilationResult:
-    factors: dict[str, tuple[Tensor, Tensor]] = {}
-    ranks: dict[str, int] = {}
-    for offset, (name, delta) in enumerate(sorted(minimization.deltas.items())):
-        rank = min(source.ranks.get(name, 1), *delta.shape)
-        left, right = low_rank_factors(delta, rank=rank, seed=47 + offset)
-        factors[name] = (left, right)
-        ranks[name] = rank
+    factors = {
+        name: (left.detach().clone(), right.detach().clone())
+        for name, (left, right) in sorted(minimization.factors.items())
+    }
+    ranks = {name: left.shape[1] for name, (left, _right) in factors.items()}
     return CompilationResult(
         status=source.status,
         deltas={name: left @ right for name, (left, right) in factors.items()},
@@ -575,6 +585,7 @@ def _probe_rows(
             "id": f"target-{index:02d}",
             "prompt": prompt,
             "expected": _generated_token(adapter, target, prompt)[1],
+            "reference_logits": _reference_logits(adapter, target, prompt),
         }
         for index, prompt in enumerate(_VALIDATION_TARGETS)
     ]
@@ -591,6 +602,7 @@ def _probe_rows(
             "id": f"sealed-target-{index:02d}",
             "prompt": prompt,
             "expected": _generated_token(adapter, target, prompt)[1],
+            "reference_logits": _reference_logits(adapter, target, prompt),
         }
         for index, prompt in enumerate(_SEALED_TARGETS)
     ]
@@ -864,12 +876,6 @@ def _complete_bundle(
         },
         "contract_hash": contract.contract_id,
     }
-    with tempfile.TemporaryDirectory(prefix="modelpact-forkbench-codegen-", dir=root) as temp:
-        generated_root = Path(temp)
-        apply_path = emit_apply_script(initial.path, generated_root / "apply_patch.py")
-        verify_path = emit_verify_script(initial.path, generated_root / "verify_patch.py")
-        apply_bytes = apply_path.read_bytes()
-        verify_bytes = verify_path.read_bytes()
     holdout_evidence = {
         "schema_version": 1,
         "outcome": report.holdout_outcome.value,
@@ -893,12 +899,27 @@ def _complete_bundle(
             unselected_preservation_rate=unselected_preservation_rate,
             negative_findings=negative_findings,
         ).encode(),
-        "apply_patch.py": apply_bytes,
-        "verify_patch.py": verify_bytes,
     }
-    return attach_bundle_artifacts(
+    enriched = attach_bundle_artifacts(
         initial.path,
         supplemental,
+        state_schema=None,
+    )
+    with tempfile.TemporaryDirectory(prefix="modelpact-forkbench-codegen-", dir=root) as temp:
+        generated_root = Path(temp)
+        apply_bytes = emit_apply_script(
+            enriched.path,
+            generated_root / "apply_patch.py",
+            will_live_in_bundle=True,
+        ).read_bytes()
+        verify_bytes = emit_verify_script(
+            enriched.path,
+            generated_root / "verify_patch.py",
+            will_live_in_bundle=True,
+        ).read_bytes()
+    return attach_bundle_artifacts(
+        enriched.path,
+        {"apply_patch.py": apply_bytes, "verify_patch.py": verify_bytes},
         state_schema=None,
         require_complete=True,
     )
@@ -1014,6 +1035,7 @@ def _run_forkbench_at(root: Path, config: ForkBenchConfig) -> dict[str, object]:
         lambda deltas: _passes_visible_contracts(adapter, base, target, deltas),
         verification_budget=config.minimization_budget,
         seed=31,
+        initial_factors=cegis.candidate.factors,
     )
     minimized = _minimized_compilation(cegis.candidate, minimization)
     minimization_seconds = time.perf_counter() - stage_started
@@ -1046,9 +1068,10 @@ def _run_forkbench_at(root: Path, config: ForkBenchConfig) -> dict[str, object]:
         contracts={
             "contracts/target.yaml": (canonical_contract_json(contract) + "\n").encode(),
             "contracts/preservation.yaml": (canonical_contract_json(preservation) + "\n").encode(),
+            **{f"contracts/{relative}": content for relative, content in sorted(probes.items())},
         },
-        provides=(contract.id,),
-        preserves=(preservation.id,),
+        provides=(contract.contract_id,),
+        preserves=tuple(sorted({contract.contract_id, preservation.contract_id})),
         verification_policy_hash=hash_canonical(policy),
         source_diff_bundle=str(diff_manifest["witness_set_hash"]),
         compiler_configuration={

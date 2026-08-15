@@ -1,8 +1,10 @@
 # Contract Closure Matrix
 
-This configuration executes the six-patch analytic closure organism and all 63
-nonempty subsets. Every margin is produced by a PyTorch forward pass. The run is
-small enough for normal CPU CI and needs no network access.
+This configuration deterministically builds one TinyCausalLM base and six
+content-addressed low-rank Behavior Patch bundles, verifies every singleton,
+and executes all 63 nonempty stacks. Every outcome comes from a runtime-mounted
+delta, TinyCausalLM forward logits, and one-token autoregressive generation.
+The run is small enough for normal CPU CI and needs no network access.
 
 From an installed checkout:
 
@@ -15,4 +17,6 @@ python benchmarks/run.py \
 The output is generated evidence, not a committed release score. Inspect
 `results.closure_matrix.claims`, `failing_subsets`, and
 `search_space_exhausted`; only the executed 63-subset run supports exhaustive
-wording for this particular analytic pool.
+wording for this particular finite TinyCausalLM pool. `subset_ground_truth`
+retains every signed contract margin, generated token identity, and execution
+hash.
