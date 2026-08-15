@@ -1,4 +1,4 @@
-"""Execute one committed PactBench configuration and write raw JSON evidence."""
+"""Execute one committed ModelPactBench configuration and write raw JSON evidence."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from modelpact.pactbench.runner import run_selected
+from modelpact.modelpactbench.runner import run_selected
 from modelpact.util.atomic import atomic_write_text
 from modelpact.util.canonical_json import canonical_dumps
 from modelpact.util.hashing import hash_canonical
@@ -47,7 +47,7 @@ def _load_configuration(path: Path) -> dict[str, object]:
         raise ValueError("experiments must be a nonempty sorted unique string list")
     unsupported = set(experiments) - SUPPORTED_EXPERIMENTS
     if unsupported:
-        raise ValueError(f"unsupported PactBench experiments: {sorted(unsupported)}")
+        raise ValueError(f"unsupported ModelPactBench experiments: {sorted(unsupported)}")
     return value
 
 
