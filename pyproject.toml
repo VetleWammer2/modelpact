@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "modelpact"
+version = "0.1.0"
+description = "Compile, compose, rebase, audit, and revert learned behavior."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "ModelPact contributors" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=1.26",
+  "pyyaml>=6.0.2",
+  "safetensors>=0.5.2",
+  "torch>=2.2",
+  "typer>=0.15",
+]
+
+[project.optional-dependencies]
+huggingface = ["transformers>=4.48"]
+parquet = ["pyarrow>=18"]
+research = ["scipy>=1.12", "scikit-learn>=1.5"]
+dev = [
+  "build>=1.2",
+  "hypothesis>=6.120",
+  "mypy>=1.14",
+  "pip-audit>=2.7",
+  "pytest>=8.3",
+  "pytest-cov>=6",
+  "ruff>=0.9",
+]
+
+[project.scripts]
+modelpact = "modelpact.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/modelpact"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+markers = [
+  "integration: real multi-component workflows",
+  "slow: bounded but slower research workflows",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["research/artifacts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PIE", "RUF", "S", "T20"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+"benchmarks/**/*.py" = ["T201"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["modelpact"]
+warn_unused_configs = true
+exclude = ["benchmarks/"]
+
