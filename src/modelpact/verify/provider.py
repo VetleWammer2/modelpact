@@ -44,6 +44,7 @@ class ProbeLimits:
     max_prompt_characters: int = 1_000_000
     max_completion_characters: int = 1_000_000
     max_choices: int = 10_000
+    max_logit_values: int = 10_000_000
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
@@ -77,6 +78,7 @@ _ALLOWED_PROBE_FIELDS = {
     "token_id",
     "position",
     "input_hash",
+    "reference_logits",
 }
 _GENERATIVE_TYPES = frozenset(
     {
@@ -321,15 +323,24 @@ class ModelBackedRecordProvider:
             raise UnsupportedRecordProviderError(
                 "adapter protocol currently supports at most 4096 generated tokens"
             )
-        if policy.top_k is not None or policy.top_p != 1.0 or policy.stop_sequences:
+        sampling_controls = policy.top_k is not None or policy.top_p != 1.0
+        if sampling_controls and not bool(
+            getattr(self._adapter, "supports_sampling_controls", False)
+        ):
             raise UnsupportedRecordProviderError(
-                "adapter protocol cannot represent top-k/top-p/stop-sequence generation"
+                "selected adapter cannot represent top-k/top-p generation"
+            )
+        if policy.stop_sequences:
+            raise UnsupportedRecordProviderError(
+                "adapter protocol cannot represent stop-sequence generation"
             )
         return AdapterGenerationPolicy(
             mode="greedy" if policy.mode is GenerationMode.GREEDY else "sample",
             max_new_tokens=policy.max_new_tokens,
             seed=seed,
             temperature=policy.temperature,
+            top_k=policy.top_k,
+            top_p=policy.top_p,
         )
 
     def _generated(self, source: str, raw: Mapping[str, object], seed: int) -> EvaluationRecord:
@@ -421,11 +432,27 @@ class ModelBackedRecordProvider:
         reference_logits = None
         base_logits = None
         if assertion.type is AssertionType.REFERENCE_KL:
-            if self._reference_model is None:
+            supplied = raw.get("reference_logits")
+            if self._reference_model is not None:
+                reference_logits, _ = self._logits(self._reference_model, scored_text)
+            elif supplied is not None:
+                try:
+                    reference_logits = torch.tensor(supplied, dtype=logits.dtype)
+                except (TypeError, ValueError, RuntimeError) as error:
+                    raise ProbeDataError("reference_logits must be a numeric matrix") from error
+                if (
+                    reference_logits.ndim != 2
+                    or reference_logits.shape != logits.shape
+                    or reference_logits.numel() > self._limits.max_logit_values
+                    or not bool(torch.isfinite(reference_logits).all())
+                ):
+                    raise ProbeDataError(
+                        "reference_logits must be finite, bounded, and match executed logits"
+                    )
+            else:
                 raise UnsupportedRecordProviderError(
-                    "reference_kl requires a locally loaded reference model"
+                    "reference_kl requires a local reference model or bounded probe logits"
                 )
-            reference_logits, _ = self._logits(self._reference_model, scored_text)
         if assertion.type is AssertionType.BASE_KL:
             if self._base_model is None:
                 raise UnsupportedRecordProviderError(

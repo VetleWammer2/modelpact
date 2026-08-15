@@ -22,6 +22,19 @@ class CanonicalJSONError(ValueError):
     """Raised when a value is outside ModelPact's canonical JSON domain."""
 
 
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise CanonicalJSONError(f"duplicate JSON object key: {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_constant(value: str) -> None:
+    raise CanonicalJSONError(f"non-finite JSON number is not permitted: {value}")
+
+
 def _normalize(value: Any, *, depth: int, max_depth: int) -> Any:
     if depth > max_depth:
         raise CanonicalJSONError(f"maximum nesting depth {max_depth} exceeded")
@@ -67,3 +80,21 @@ def canonical_json_bytes(value: Any, *, max_depth: int = 64) -> bytes:
     """Return canonical JSON encoded as UTF-8 without a byte-order mark."""
 
     return canonical_dumps(value, max_depth=max_depth).encode("utf-8")
+
+
+def strict_json_loads(text: str | bytes, *, max_depth: int = 64) -> Any:
+    """Parse JSON while rejecting duplicate keys and non-canonical values."""
+
+    try:
+        decoded = text.decode("utf-8-sig") if isinstance(text, bytes) else text
+        value = json.loads(
+            decoded,
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_constant,
+        )
+    except UnicodeDecodeError as error:
+        raise CanonicalJSONError("JSON document must be UTF-8") from error
+    except json.JSONDecodeError as error:
+        raise CanonicalJSONError("malformed JSON document") from error
+    _normalize(value, depth=0, max_depth=max_depth)
+    return value

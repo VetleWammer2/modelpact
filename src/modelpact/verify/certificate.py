@@ -7,8 +7,10 @@ optionally every referenced artifact.  It never executes bundle content.
 
 from __future__ import annotations
 
+import math
 import platform
 import sys
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +19,8 @@ from typing import cast
 import torch
 
 from modelpact import __version__
-from modelpact.contracts.ast import AssertionType, BehaviorContract
+from modelpact.contracts.assertions import AssertionEvaluation
+from modelpact.contracts.ast import AssertionType, BehaviorContract, VerificationAssertion
 from modelpact.contracts.parser import ContractLimits, loads_data
 from modelpact.status import (
     AuditClaim,
@@ -42,6 +45,10 @@ _CERTIFICATE_LIMITS = ContractLimits(
     max_assertions=100_000,
 )
 _HASH_LENGTH = 71
+_MAX_CERTIFICATE_ARTIFACTS = 10_000
+_MAX_CERTIFICATE_ARTIFACT_BYTES = 512 * 1024**2
+_MAX_CERTIFICATE_TENSOR_BYTES = 16 * 1024**3
+_MAX_CERTIFICATE_AGGREGATE_BYTES = _MAX_CERTIFICATE_TENSOR_BYTES + _MAX_CERTIFICATE_ARTIFACT_BYTES
 _ALLOWED_CLAIMS = frozenset(
     item.value
     for enum_type in (PatchClaim, CompositionClaim, RebaseClaim, AuditClaim)
@@ -252,6 +259,95 @@ def _derived_claims(
     return tuple(sorted(claims))
 
 
+_BINARY_ASSERTION_TYPES = frozenset(
+    {
+        AssertionType.EXACT_MATCH.value,
+        AssertionType.NORMALIZED_EXACT_MATCH.value,
+        AssertionType.REGULAR_EXPRESSION.value,
+        AssertionType.JSON_PARSE.value,
+        AssertionType.JSON_SCHEMA.value,
+        AssertionType.FREE_GENERATION_MATCH.value,
+        AssertionType.SEQUENCE_MARGIN.value,
+        AssertionType.MULTIPLE_CHOICE_MARGIN.value,
+    }
+)
+_CONTINUOUS_ACCEPTANCE_FIELDS = frozenset(
+    {"minimum", "maximum", "maximum_mean", "maximum_item", "maximum_quantile"}
+)
+
+
+def _acceptance_policy(assertion: VerificationAssertion) -> dict[str, object]:
+    """Serialize the exact numeric acceptance rule used by the evaluator.
+
+    Assertion results alone are insufficient to reconstruct a continuous
+    margin: an observed mean does not reveal whether the contract declared a
+    minimum, maximum, per-item limit, or quantile.  Certificates therefore bind
+    the executable acceptance projection alongside every result.
+    """
+
+    if assertion.type.value in _BINARY_ASSERTION_TYPES:
+        threshold = assertion.option("minimum_pass_rate", 1.0)
+        if isinstance(threshold, bool) or not isinstance(threshold, int | float):
+            raise CertificateIntegrityError("binary assertion pass-rate threshold is invalid")
+        return {"minimum_pass_rate": float(threshold)}
+    return {
+        name: assertion.option(name)
+        for name in sorted(_CONTINUOUS_ACCEPTANCE_FIELDS)
+        if assertion.option(name) is not None
+    }
+
+
+def _assertion_evidence(
+    results: Sequence[AssertionEvaluation],
+    assertions: Sequence[VerificationAssertion],
+    *,
+    require_all: bool = True,
+) -> list[dict[str, object]]:
+    by_id = {assertion.id: assertion for assertion in assertions}
+    if len(by_id) != len(assertions):
+        raise CertificateIntegrityError("contract contains duplicate assertion identities")
+    evidence: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for result in results:
+        candidates: list[str] = []
+        if result.assertion_id in by_id:
+            candidates = [result.assertion_id]
+        else:
+            for suffix in (":holdout-target", ":holdout-guard"):
+                if result.assertion_id.endswith(suffix):
+                    stripped = result.assertion_id[: -len(suffix)]
+                    if stripped in by_id:
+                        candidates = [stripped]
+                    break
+        if not candidates:
+            # A union certificate bounds IDs to 128 characters.  If only a
+            # suffix was truncated, retain the unique longest contract-ID
+            # prefix instead of weakening identity matching generally.
+            prefixes = [
+                identifier
+                for identifier in by_id
+                if result.assertion_id.startswith(f"{identifier}:")
+            ]
+            if prefixes:
+                longest = max(map(len, prefixes))
+                candidates = [item for item in prefixes if len(item) == longest]
+        base_id = candidates[0] if len(candidates) == 1 else ""
+        assertion = by_id.get(base_id)
+        if assertion is None or base_id in seen or result.assertion_type is not assertion.type:
+            raise CertificateIntegrityError(
+                "verification report assertion identity does not match its contract"
+            )
+        seen.add(base_id)
+        item = result.to_dict()
+        item["acceptance_policy"] = _acceptance_policy(assertion)
+        evidence.append(item)
+    if require_all and seen != set(by_id):
+        raise CertificateIntegrityError(
+            "verification report assertion count does not match its contract"
+        )
+    return evidence
+
+
 def build_certificate(
     report: VerificationReport,
     contract: BehaviorContract,
@@ -270,6 +366,7 @@ def build_certificate(
     objectives_optimized: bool = False,
     minimized_within_budget: bool = False,
     additional_warnings: Sequence[str] = (),
+    contract_hashes: Mapping[str, str] | None = None,
 ) -> VerificationCertificate:
     if report.contract_hash != contract.contract_id:
         raise CertificateIntegrityError("verification report and contract hashes differ")
@@ -281,11 +378,6 @@ def build_certificate(
         "statistics": contract.statistics.to_dict(),
         "generation": contract.generation.to_dict(),
     }
-    holdout = {
-        "outcome": report.holdout_outcome.value,
-        "targets": [item.to_dict() for item in report.holdout_target_results],
-        "guards": [item.to_dict() for item in report.holdout_guard_results],
-    }
     payload: dict[str, object] = {
         "schema_version": 1,
         "modelpact_version": __version__,
@@ -294,7 +386,11 @@ def build_certificate(
         "model_adapter_id": report.identity.adapter_id,
         "checkpoint_hashes": dict(sorted(checkpoint_hashes.items())),
         "tokenizer_hash": report.identity.tokenizer_hash,
-        "contract_hashes": {contract.id: contract.contract_id},
+        "contract_hashes": dict(
+            sorted(contract_hashes.items())
+            if contract_hashes is not None
+            else ((contract.id, contract.contract_id),)
+        ),
         "probe_hashes": dict(sorted(report.probe_hashes.items())),
         "verification_policy_hash": hash_canonical(policy),
         "generation_policy": contract.generation.to_dict(),
@@ -303,9 +399,21 @@ def build_certificate(
             "generation_seeds": list(contract.generation.seeds),
         },
         "compile_objectives": [item.to_dict() for item in contract.objectives],
-        "target_assertions": [item.to_dict() for item in report.target_results],
-        "guard_assertions": [item.to_dict() for item in report.guard_results],
-        "sealed_holdout_result": holdout,
+        "target_assertions": _assertion_evidence(report.target_results, contract.targets),
+        "guard_assertions": _assertion_evidence(report.guard_results, contract.guards),
+        "sealed_holdout_result": {
+            "outcome": report.holdout_outcome.value,
+            "targets": _assertion_evidence(
+                report.holdout_target_results,
+                contract.targets,
+                require_all=False,
+            ),
+            "guards": _assertion_evidence(
+                report.holdout_guard_results,
+                contract.guards,
+                require_all=False,
+            ),
+        },
         "free_generation_results": [item.to_dict() for item in report.free_generation_records],
         "prompt_level_metrics": list(_prompt_metrics(report)),
         "statistical_intervals": list(_intervals(report)),
@@ -518,15 +626,323 @@ def certificate_from_dict(value: Mapping[str, object]) -> VerificationCertificat
     return certificate
 
 
-def _all_pass(assertions: Sequence[Mapping[str, object]]) -> bool:
-    outcomes_pass = all(
-        item.get("outcome") == VerificationOutcome.PASS.value for item in assertions
+def _finite_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None
+
+
+def _prompt_metric_is_consistent(metric: Mapping[str, object]) -> bool:
+    outcome = metric.get("outcome")
+    if outcome not in {item.value for item in VerificationOutcome}:
+        return False
+    margin_value = metric.get("margin")
+    margin = None if margin_value is None else _finite_number(margin_value)
+    if margin_value is not None and margin is None:
+        return False
+    if outcome == VerificationOutcome.PASS.value:
+        return margin is None or margin >= 0.0
+    if outcome == VerificationOutcome.FAIL.value:
+        return margin is not None and margin < 0.0
+    return margin is None
+
+
+def _acceptance_mapping(assertion: Mapping[str, object]) -> Mapping[str, object] | None:
+    policy = assertion.get("acceptance_policy")
+    return policy if isinstance(policy, Mapping) else None
+
+
+def _continuous_policy_is_valid(policy: Mapping[str, object]) -> bool:
+    if not policy or not set(policy).issubset(_CONTINUOUS_ACCEPTANCE_FIELDS):
+        return False
+    for name in ("minimum", "maximum", "maximum_mean", "maximum_item"):
+        if name in policy and _finite_number(policy[name]) is None:
+            return False
+    quantile = policy.get("maximum_quantile")
+    if quantile is None:
+        return True
+    if not isinstance(quantile, Mapping) or set(quantile) != {"q", "value"}:
+        return False
+    q = _finite_number(quantile.get("q"))
+    return q is not None and 0.0 < q <= 1.0 and _finite_number(quantile.get("value")) is not None
+
+
+def _continuous_margin(values: Sequence[float], policy: Mapping[str, object]) -> float | None:
+    margins: list[float] = []
+    minimum = _finite_number(policy.get("minimum"))
+    maximum = _finite_number(policy.get("maximum"))
+    maximum_mean = _finite_number(policy.get("maximum_mean"))
+    maximum_item = _finite_number(policy.get("maximum_item"))
+    if minimum is not None:
+        margins.append(min(values) - minimum)
+    if maximum is not None:
+        margins.append(maximum - max(values))
+    if maximum_mean is not None:
+        margins.append(maximum_mean - (sum(values) / len(values)))
+    if maximum_item is not None:
+        margins.append(maximum_item - max(values))
+    quantile = policy.get("maximum_quantile")
+    if isinstance(quantile, Mapping):
+        q = _finite_number(quantile.get("q"))
+        limit = _finite_number(quantile.get("value"))
+        if q is None or limit is None:
+            return None
+        ordered = sorted(values)
+        observed = ordered[max(0, math.ceil(q * len(ordered)) - 1)]
+        margins.append(limit - observed)
+    return min(margins) if margins else None
+
+
+def _continuous_prompt_metrics_are_consistent(
+    prompt_metrics: Sequence[Mapping[str, object]], policy: Mapping[str, object]
+) -> tuple[float, ...] | None:
+    values: list[float] = []
+    item_minimum = _finite_number(policy.get("minimum"))
+    item_limit = _finite_number(policy.get("maximum_item", policy.get("maximum")))
+    for item in prompt_metrics:
+        value = _finite_number(item.get("value"))
+        if value is None:
+            return None
+        values.append(value)
+        margins: list[float] = []
+        if item_limit is not None:
+            margins.append(item_limit - value)
+        if item_minimum is not None:
+            margins.append(value - item_minimum)
+        expected_margin = min(margins) if margins else None
+        observed_margin_value = item.get("margin")
+        observed_margin = (
+            None if observed_margin_value is None else _finite_number(observed_margin_value)
+        )
+        if expected_margin is None:
+            if (
+                observed_margin_value is not None
+                or item.get("outcome") != VerificationOutcome.PASS.value
+            ):
+                return None
+            continue
+        if observed_margin is None or not math.isclose(
+            observed_margin, expected_margin, rel_tol=1e-12, abs_tol=1e-12
+        ):
+            return None
+        expected_outcome = (
+            VerificationOutcome.PASS.value
+            if expected_margin >= 0.0
+            else VerificationOutcome.FAIL.value
+        )
+        if item.get("outcome") != expected_outcome:
+            return None
+    return tuple(values)
+
+
+def _assertion_is_consistent(assertion: Mapping[str, object]) -> bool:
+    """Validate aggregate evidence without requiring every prompt to pass.
+
+    Binary assertions use their recorded ``minimum_pass_rate``. Continuous
+    assertions carry the exact numeric acceptance projection from the executed
+    contract. The aggregate value, margin, prompt outcomes, and policy must all
+    agree; a rehashed result mutation cannot preserve a passing claim merely by
+    leaving the old positive margin in place.
+    """
+
+    outcome = assertion.get("outcome")
+    if outcome not in {item.value for item in VerificationOutcome}:
+        return False
+    assertion_type = assertion.get("assertion_type")
+    if assertion_type not in {item.value for item in AssertionType}:
+        return False
+    acceptance = _acceptance_mapping(assertion)
+    if acceptance is None:
+        return False
+    prompt_metrics = assertion.get("prompt_metrics")
+    if not isinstance(prompt_metrics, list) or not all(
+        isinstance(item, Mapping) and _prompt_metric_is_consistent(item) for item in prompt_metrics
+    ):
+        return False
+    if outcome not in {VerificationOutcome.PASS.value, VerificationOutcome.FAIL.value}:
+        return (
+            assertion.get("value") is None
+            and assertion.get("margin") is None
+            and all(item.get("outcome") == outcome for item in prompt_metrics)
+        )
+    if not prompt_metrics:
+        return False
+    margin = _finite_number(assertion.get("margin"))
+    if margin is None:
+        return False
+    expected_outcome = (
+        VerificationOutcome.PASS.value if margin >= 0.0 else VerificationOutcome.FAIL.value
     )
-    return bool(assertions) and outcomes_pass
+    if outcome != expected_outcome:
+        return False
+    if assertion_type in _BINARY_ASSERTION_TYPES:
+        if set(acceptance) != {"minimum_pass_rate"}:
+            return False
+        threshold = _finite_number(acceptance.get("minimum_pass_rate"))
+        if threshold is None or not 0.0 <= threshold <= 1.0:
+            return False
+        if any(
+            item.get("outcome")
+            not in {VerificationOutcome.PASS.value, VerificationOutcome.FAIL.value}
+            for item in prompt_metrics
+        ):
+            return False
+        observed = sum(
+            item.get("outcome") == VerificationOutcome.PASS.value for item in prompt_metrics
+        ) / len(prompt_metrics)
+        value = _finite_number(assertion.get("value"))
+        if value is None or not math.isclose(value, observed, rel_tol=1e-12, abs_tol=1e-12):
+            return False
+        expected_outcome = (
+            VerificationOutcome.PASS.value
+            if observed + 1e-12 >= threshold
+            else VerificationOutcome.FAIL.value
+        )
+        return outcome == expected_outcome and math.isclose(
+            margin, observed - threshold, rel_tol=1e-12, abs_tol=1e-12
+        )
+    if not _continuous_policy_is_valid(acceptance):
+        return False
+    numeric_values = _continuous_prompt_metrics_are_consistent(prompt_metrics, acceptance)
+    value = _finite_number(assertion.get("value"))
+    expected_margin = (
+        None if numeric_values is None else _continuous_margin(numeric_values, acceptance)
+    )
+    return (
+        value is not None
+        and numeric_values is not None
+        and expected_margin is not None
+        and math.isclose(
+            value,
+            sum(numeric_values) / len(numeric_values),
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+        and math.isclose(margin, expected_margin, rel_tol=1e-12, abs_tol=1e-12)
+    )
+
+
+def _assertion_passes(assertion: Mapping[str, object]) -> bool:
+    return assertion.get("outcome") == VerificationOutcome.PASS.value and _assertion_is_consistent(
+        assertion
+    )
+
+
+def _all_pass(assertions: Sequence[Mapping[str, object]]) -> bool:
+    return bool(assertions) and all(_assertion_passes(item) for item in assertions)
+
+
+def _holdout_evidence(
+    certificate: VerificationCertificate,
+) -> tuple[Mapping[str, object], ...]:
+    targets = certificate.sealed_holdout_result.get("targets", [])
+    guards = certificate.sealed_holdout_result.get("guards", [])
+    if (
+        not isinstance(targets, list)
+        or not isinstance(guards, list)
+        or not all(isinstance(item, Mapping) for item in (*targets, *guards))
+    ):
+        raise CertificateError("sealed holdout assertions must be arrays of objects")
+    return tuple(cast(Mapping[str, object], item) for item in (*targets, *guards))
+
+
+def _free_generation_supports_claim(certificate: VerificationCertificate) -> bool:
+    generative_types = {
+        AssertionType.EXACT_MATCH.value,
+        AssertionType.NORMALIZED_EXACT_MATCH.value,
+        AssertionType.REGULAR_EXPRESSION.value,
+        AssertionType.JSON_PARSE.value,
+        AssertionType.JSON_SCHEMA.value,
+        AssertionType.FREE_GENERATION_MATCH.value,
+        AssertionType.GENERATION_LENGTH.value,
+    }
+    assertions = (
+        *certificate.target_assertions,
+        *certificate.guard_assertions,
+        *_holdout_evidence(certificate),
+    )
+    relevant = tuple(item for item in assertions if item.get("assertion_type") in generative_types)
+    if (
+        not certificate.free_generation_results
+        or not relevant
+        or not all(_assertion_passes(item) for item in relevant)
+    ):
+        return False
+    failed_prompt_keys = Counter(
+        (item.get("prompt_hash"), item.get("output_hash"))
+        for assertion in relevant
+        for item in cast(list[Mapping[str, object]], assertion.get("prompt_metrics", []))
+        if item.get("outcome") == VerificationOutcome.FAIL.value
+    )
+    for record in certificate.free_generation_results:
+        parser_result = record.get("parser_result", {})
+        if not isinstance(parser_result, Mapping):
+            return False
+        if parser_result.get("passed") is False or parser_result.get("valid") is False:
+            key = (record.get("prompt_hash"), record.get("output_hash"))
+            if failed_prompt_keys[key] <= 0:
+                return False
+            failed_prompt_keys[key] -= 1
+    return True
+
+
+def _prompt_level_metrics_are_consistent(certificate: VerificationCertificate) -> bool:
+    expected: list[Mapping[str, object]] = []
+    groups = (
+        ("target", certificate.target_assertions),
+        ("guard", certificate.guard_assertions),
+        (
+            "holdout_target",
+            tuple(
+                item
+                for item in _holdout_evidence(certificate)
+                if str(item.get("assertion_id", "")).endswith(":holdout-target")
+            ),
+        ),
+        (
+            "holdout_guard",
+            tuple(
+                item
+                for item in _holdout_evidence(certificate)
+                if str(item.get("assertion_id", "")).endswith(":holdout-guard")
+            ),
+        ),
+    )
+    for role, assertions in groups:
+        for assertion in assertions:
+            prompt_metrics = assertion.get("prompt_metrics")
+            if not isinstance(prompt_metrics, list):
+                return False
+            assertion_id = assertion.get("assertion_id")
+            if not isinstance(assertion_id, str):
+                return False
+            expected.extend(
+                {"role": role, "assertion_id": assertion_id, **dict(item)}
+                for item in prompt_metrics
+                if isinstance(item, Mapping)
+            )
+    return hash_canonical(expected) == hash_canonical(certificate.prompt_level_metrics)
 
 
 def _validate_claim_evidence(certificate: VerificationCertificate) -> None:
     claims = set(certificate.claims)
+    holdout_assertions = _holdout_evidence(certificate)
+    all_assertions = (
+        *certificate.target_assertions,
+        *certificate.guard_assertions,
+        *holdout_assertions,
+    )
+    if not all(_assertion_is_consistent(item) for item in all_assertions):
+        raise CertificateIntegrityError(
+            "PASS certificate contains a non-passing assertion or inconsistent "
+            "assertion aggregate evidence"
+        )
+    if not _prompt_level_metrics_are_consistent(certificate):
+        raise CertificateIntegrityError("prompt-level metrics do not match assertion evidence")
+    holdout_passes = bool(holdout_assertions) and all(
+        _assertion_passes(item) for item in holdout_assertions
+    )
     checks = (
         (
             PatchClaim.BASE_COMPATIBLE.value,
@@ -545,22 +961,64 @@ def _validate_claim_evidence(certificate: VerificationCertificate) -> None:
         ),
         (
             PatchClaim.SEALED_HOLDOUT_VERIFIED.value,
-            certificate.sealed_holdout_result.get("outcome") == VerificationOutcome.PASS.value,
-            "sealed holdout outcome is not PASS",
+            certificate.sealed_holdout_result.get("outcome") == VerificationOutcome.PASS.value
+            and holdout_passes,
+            "sealed holdout evidence is absent or not all passing",
         ),
         (
             PatchClaim.FREE_GENERATION_VERIFIED.value,
-            bool(certificate.free_generation_results),
-            "free-generation evidence is absent",
+            _free_generation_supports_claim(certificate),
+            "free-generation evidence is absent or internally failing",
         ),
     )
     for claim, supported, reason in checks:
         if claim in claims and not supported:
             raise CertificateIntegrityError(f"claim {claim} is unsupported: {reason}")
-    if certificate.verification_outcome is VerificationOutcome.PASS and (
-        not _all_pass(certificate.target_assertions) and not _all_pass(certificate.guard_assertions)
+    holdout_outcome = certificate.sealed_holdout_result.get("outcome")
+    if holdout_outcome not in {item.value for item in VerificationOutcome}:
+        raise CertificateError("sealed holdout outcome is unknown")
+    if holdout_outcome == VerificationOutcome.PASS.value and not holdout_passes:
+        raise CertificateIntegrityError("PASS sealed holdout contains failing or absent evidence")
+    if (
+        holdout_assertions
+        and (holdout_outcome != VerificationOutcome.PASS.value or not holdout_passes)
+        and certificate.verification_outcome is VerificationOutcome.PASS
     ):
-        raise CertificateIntegrityError("PASS certificate contains no passing assertion group")
+        raise CertificateIntegrityError("PASS certificate contains a non-passing sealed holdout")
+    validation_assertions = (
+        *certificate.target_assertions,
+        *certificate.guard_assertions,
+    )
+    if certificate.verification_outcome is VerificationOutcome.PASS:
+        if certificate.compatibility_errors:
+            raise CertificateIntegrityError("PASS certificate contains compatibility errors")
+        if not certificate.target_assertions:
+            raise CertificateIntegrityError("PASS certificate contains no target assertions")
+        if not certificate.guard_assertions:
+            raise CertificateIntegrityError(
+                "PASS certificate contains no preservation guard assertions"
+            )
+        if not validation_assertions or not all(
+            _assertion_passes(item) for item in validation_assertions
+        ):
+            raise CertificateIntegrityError("PASS certificate contains a non-passing assertion")
+        generative = any(
+            item.get("assertion_type")
+            in {
+                AssertionType.EXACT_MATCH.value,
+                AssertionType.NORMALIZED_EXACT_MATCH.value,
+                AssertionType.REGULAR_EXPRESSION.value,
+                AssertionType.JSON_PARSE.value,
+                AssertionType.JSON_SCHEMA.value,
+                AssertionType.FREE_GENERATION_MATCH.value,
+                AssertionType.GENERATION_LENGTH.value,
+            }
+            for item in (*validation_assertions, *holdout_assertions)
+        )
+        if generative and not _free_generation_supports_claim(certificate):
+            raise CertificateIntegrityError(
+                "PASS certificate lacks passing free-generation execution evidence"
+            )
 
 
 def loads_certificate(text: str | bytes) -> VerificationCertificate:
@@ -633,11 +1091,38 @@ def validate_certificate(
                     f"observed {observed_mapping.get(key)}"
                 )
     if artifact_root is not None:
+        if len(reparsed.artifact_hashes) > _MAX_CERTIFICATE_ARTIFACTS:
+            raise CertificateIntegrityError("certificate references too many artifacts")
+        root = Path(artifact_root).resolve()
+        aggregate = 0
         for relative, declared_hash in sorted(reparsed.artifact_hashes.items()):
+            parts = safe_relative_path(relative).parts
+            current = root
+            for part in parts:
+                current /= part
+                if current.is_symlink():
+                    raise CertificateIntegrityError(
+                        f"referenced artifact path contains a symlink: {relative}"
+                    )
             path = resolve_inside(artifact_root, relative)
             if not path.is_file():
                 raise CertificateIntegrityError(f"referenced artifact is missing: {relative}")
-            observed_hash = sha256_file(path)
+            limit = (
+                _MAX_CERTIFICATE_TENSOR_BYTES
+                if relative.endswith(".safetensors")
+                else _MAX_CERTIFICATE_ARTIFACT_BYTES
+            )
+            size = path.stat().st_size
+            if size > limit:
+                raise CertificateIntegrityError(
+                    f"referenced artifact exceeds size limit: {relative}"
+                )
+            aggregate += size
+            if aggregate > _MAX_CERTIFICATE_AGGREGATE_BYTES:
+                raise CertificateIntegrityError(
+                    "certificate artifacts exceed the aggregate size limit"
+                )
+            observed_hash = sha256_file(path, max_bytes=limit)
             if observed_hash != declared_hash:
                 raise CertificateIntegrityError(
                     f"artifact hash mismatch for {relative}: "

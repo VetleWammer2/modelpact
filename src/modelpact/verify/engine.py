@@ -133,9 +133,14 @@ class VerificationReport:
             raise ValueError("verification report contains duplicate assertion result IDs")
         if self.outcome is VerificationOutcome.PASS and any(
             result.outcome is not VerificationOutcome.PASS
-            for result in (*self.target_results, *self.guard_results)
+            for result in (
+                *self.target_results,
+                *self.guard_results,
+                *self.holdout_target_results,
+                *self.holdout_guard_results,
+            )
         ):
-            raise ValueError("PASS report contains a non-passing validation assertion")
+            raise ValueError("PASS report contains a non-passing executed assertion")
 
     @property
     def result_hash(self) -> str:
@@ -369,6 +374,8 @@ def verify_contract(
     holdout_outcome = combine_outcomes(
         [result.outcome for result in (*holdout_targets, *holdout_guards)]
     )
+    if include_holdout and contract.holdout.configured:
+        outcome = combine_outcomes((outcome, holdout_outcome))
     unsupported_claims: list[str] = []
     if not contract.guards:
         unsupported_claims.append("PRESERVATION_ASSERTIONS_VERIFIED")

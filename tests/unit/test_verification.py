@@ -124,6 +124,42 @@ def test_verification_executes_targets_guards_holdout_and_generation() -> None:
     assert report.result_hash.startswith("sha256:")  # type: ignore[attr-defined]
 
 
+def test_failed_sealed_holdout_makes_overall_verification_fail() -> None:
+    contract = verification_contract()
+    failing_provider = MappingRecordProvider(
+        {
+            "targets.jsonl": (EvaluationRecord("target", "p", generated_text="okay"),),
+            "guards.jsonl": (EvaluationRecord("guard", "q", generated_text="base"),),
+            "holdout-targets.jsonl": (
+                EvaluationRecord("holdout-target", "hp", generated_text="wrong"),
+            ),
+            "holdout-guards.jsonl": (
+                EvaluationRecord("holdout-guard", "hg", generated_text="base"),
+            ),
+        }
+    )
+    gate = SealedHoldoutGate(contract)
+    gate.select_final_candidate("patch-holdout-failure")
+    capability = gate.authorize(
+        phase=HoldoutPhase.FINAL_CANDIDATE,
+        candidate_id="patch-holdout-failure",
+    )
+
+    report = verify_contract(
+        contract,
+        identity=identity(),
+        provider=failing_provider,
+        free_generation_records=generation_evidence(contract),
+        include_holdout=True,
+        holdout_gate=gate,
+        holdout_capability=capability,
+    )
+
+    assert report.holdout_outcome is VerificationOutcome.FAIL
+    assert report.outcome is VerificationOutcome.FAIL
+    assert "SEALED_HOLDOUT_VERIFIED" in report.unsupported_claims
+
+
 def test_generative_success_without_generation_evidence_is_inconclusive() -> None:
     contract = verification_contract()
     report = verify_contract(
@@ -133,6 +169,42 @@ def test_generative_success_without_generation_evidence_is_inconclusive() -> Non
     )
     assert report.outcome is VerificationOutcome.INCONCLUSIVE
     assert "FREE_GENERATION_VERIFIED" in report.unsupported_claims
+
+
+def test_target_only_contract_can_be_scoped_but_not_successfully_certified() -> None:
+    contract = loads_contract(
+        f"""
+schema_version: 1
+id: target-only
+model_requirements: {{tokenizer_hash: {HASH_A}, output_semantics: causal_lm}}
+compile: {{objectives: []}}
+verify:
+  targets:
+    - {{id: target, type: exact_match, source: targets.jsonl, expected: okay}}
+  guards: []
+holdout: {{sealed: true}}
+statistics: {{bootstrap_samples: 10, bootstrap_seed: 3}}
+generation: {{mode: greedy, max_new_tokens: 1}}
+"""
+    )
+    report = verify_contract(
+        contract,
+        identity=identity(),
+        provider=MappingRecordProvider(
+            {"targets.jsonl": (EvaluationRecord("target", "p", generated_text="okay"),)}
+        ),
+        free_generation_records=generation_evidence(contract),
+    )
+    assert report.outcome is VerificationOutcome.PASS
+    assert "PRESERVATION_ASSERTIONS_VERIFIED" in report.unsupported_claims
+    with pytest.raises(CertificateIntegrityError, match="preservation guard"):
+        build_certificate(
+            report,
+            contract,
+            patch_id="target-only-patch",
+            checkpoint_hashes={"base": HASH_A},
+            artifact_hashes={},
+        )
 
 
 def test_identity_mismatch_is_a_failure_not_compatibility_success() -> None:

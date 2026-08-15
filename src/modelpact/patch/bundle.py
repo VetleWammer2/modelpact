@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import tempfile
@@ -18,11 +17,15 @@ from modelpact.patch.manifest import PatchManifest
 from modelpact.patch.tensors import load_patch_tensors, save_patch_tensors
 from modelpact.patch.validate import load_delta_program
 from modelpact.util.atomic import atomic_write_bytes, atomic_write_text
-from modelpact.util.canonical_json import canonical_dumps
+from modelpact.util.canonical_json import CanonicalJSONError, canonical_dumps, strict_json_loads
 from modelpact.util.hashing import sha256_file
 
 MAX_MANIFEST_BYTES = 16 * 1024**2
 MAX_SUPPLEMENTAL_ARTIFACT_BYTES = 512 * 1024**2
+MAX_BUNDLE_ARTIFACTS = 10_000
+MAX_BUNDLE_ARTIFACT_BYTES = 512 * 1024**2
+MAX_BUNDLE_TENSOR_BYTES = 16 * 1024**3
+MAX_BUNDLE_AGGREGATE_BYTES = MAX_BUNDLE_TENSOR_BYTES + MAX_SUPPLEMENTAL_ARTIFACT_BYTES
 MANDATORY_BUNDLE_ARTIFACTS = frozenset(
     {
         "delta-program.json",
@@ -81,6 +84,43 @@ def _supplemental_name(path: str) -> str:
     raise ValueError(f"unsupported supplemental patch artifact: {path}")
 
 
+def bundle_artifact_size_limit(relative: str) -> int:
+    """Return the pre-hash byte limit for a recognized bundle artifact."""
+
+    safe = _safe_relative(relative)
+    if safe == "tensors.safetensors":
+        return MAX_BUNDLE_TENSOR_BYTES
+    if safe == "delta-program.json":
+        return MAX_MANIFEST_BYTES
+    if safe.startswith(("contracts/", "probes/", "evidence/")):
+        return MAX_BUNDLE_ARTIFACT_BYTES
+    if safe in {"certificate.json", "apply_patch.py", "verify_patch.py"}:
+        return MAX_MANIFEST_BYTES
+    if safe == "report.md":
+        return 64 * 1024**2
+    raise ValueError(f"unsupported patch artifact path: {safe}")
+
+
+def _bounded_bundle_artifacts(
+    root: Path, artifact_hashes: Mapping[str, str]
+) -> tuple[tuple[str, Path, int], ...]:
+    if len(artifact_hashes) > MAX_BUNDLE_ARTIFACTS:
+        raise ValueError("patch bundle contains too many artifacts")
+    bounded: list[tuple[str, Path, int]] = []
+    aggregate = 0
+    for relative in sorted(artifact_hashes):
+        path = _bundle_file(root, relative)
+        limit = bundle_artifact_size_limit(relative)
+        size = path.stat().st_size
+        if size > limit:
+            raise ValueError(f"patch artifact exceeds size limit: {relative}")
+        aggregate += size
+        if aggregate > MAX_BUNDLE_AGGREGATE_BYTES:
+            raise ValueError("patch bundle artifacts exceed the aggregate size limit")
+        bounded.append((relative, path, limit))
+    return tuple(bounded)
+
+
 def missing_bundle_artifacts(manifest: PatchManifest) -> tuple[str, ...]:
     return tuple(sorted(MANDATORY_BUNDLE_ARTIFACTS - set(manifest.artifact_hashes)))
 
@@ -91,12 +131,69 @@ def require_complete_bundle(manifest: PatchManifest) -> None:
         raise ValueError(f"patch bundle is incomplete; missing artifacts: {list(missing)}")
 
 
+def _is_executable_contract_path(relative: str) -> bool:
+    path = Path(relative)
+    if path.suffix.lower() not in {".json", ".yaml", ".yml"}:
+        return False
+    parts = path.parts
+    if len(parts) == 2 and parts[0] == "contracts":
+        return path.stem in {"target", "preservation"} or path.stem.startswith("contract-")
+    return (
+        len(parts) == 4 and parts[:2] == ("contracts", "parents") and path.name == "contract.json"
+    )
+
+
+def _validate_contract_claims(root: Path, manifest: PatchManifest) -> None:
+    """Bind manifest claims to the executable, content-addressed contracts."""
+
+    from modelpact.contracts.ast import BehaviorContract
+    from modelpact.contracts.parser import load_contract
+
+    contracts: dict[str, BehaviorContract] = {}
+    for relative in sorted(manifest.artifact_hashes):
+        if not _is_executable_contract_path(relative):
+            continue
+        contract = load_contract(_bundle_file(root, relative))
+        prior = contracts.get(contract.contract_id)
+        if prior is not None and prior.to_dict() != contract.to_dict():
+            raise ValueError("contract identity collision inside patch bundle")
+        contracts[contract.contract_id] = contract
+    target_contracts = tuple(
+        sorted(identifier for identifier, contract in contracts.items() if contract.targets)
+    )
+    guard_contracts = tuple(
+        sorted(identifier for identifier, contract in contracts.items() if contract.guards)
+    )
+    if manifest.provides != target_contracts:
+        raise ValueError(
+            "manifest provides claims do not match embedded target contracts: "
+            f"claimed={list(manifest.provides)}, embedded={list(target_contracts)}"
+        )
+    if manifest.preserves != guard_contracts:
+        raise ValueError(
+            "manifest preserves claims do not match embedded guard contracts: "
+            f"claimed={list(manifest.preserves)}, embedded={list(guard_contracts)}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class PatchBundle:
     path: Path
     manifest: PatchManifest
     program: DeltaProgram
     tensors: Mapping[str, Tensor]
+
+    @property
+    def evidence_id(self) -> str:
+        return self.manifest.evidence_id
+
+    @property
+    def bundle_id(self) -> str:
+        """Content address of the complete manifest, including generated files."""
+
+        from modelpact.util.hashing import hash_canonical
+
+        return hash_canonical(self.manifest.to_dict())
 
 
 def create_patch_bundle(
@@ -178,6 +275,7 @@ def create_patch_bundle(
             compiler_configuration=dict(compiler_configuration or {}),
         )
         manifest = replace(incomplete, patch_id=incomplete.computed_patch_id())
+        _validate_contract_claims(temporary, manifest)
         if require_complete:
             require_complete_bundle(manifest)
         atomic_write_text(
@@ -240,17 +338,19 @@ def load_patch_bundle(
     if manifest_path.stat().st_size > MAX_MANIFEST_BYTES:
         raise ValueError("patch manifest exceeds size limit")
     try:
-        value = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        value = strict_json_loads(manifest_path.read_bytes())
+    except (CanonicalJSONError, RecursionError) as error:
         raise ValueError("malformed patch manifest JSON") from error
     if not isinstance(value, Mapping):
         raise ValueError("patch manifest must be a JSON object")
     manifest = PatchManifest.from_dict(value)
     manifest.validate_identity()
-    for relative, expected in manifest.artifact_hashes.items():
-        actual = sha256_file(_bundle_file(root, relative))
+    for relative, artifact_path, limit in _bounded_bundle_artifacts(root, manifest.artifact_hashes):
+        expected = manifest.artifact_hashes[relative]
+        actual = sha256_file(artifact_path, max_bytes=limit)
         if actual != expected:
             raise ValueError(f"patch artifact hash mismatch: {relative}")
+    _validate_contract_claims(root, manifest)
     program = load_delta_program(_bundle_file(root, "delta-program.json"))
     tensors = load_patch_tensors(_bundle_file(root, "tensors.safetensors"))
     program.validate(tensors, state_schema)

@@ -18,7 +18,7 @@ from modelpact.models.fingerprint import (
     tokenizer_fingerprint,
 )
 from modelpact.models.schema import ModelStateSchema, inspect_state_schema
-from modelpact.util.hashing import hash_canonical
+from modelpact.util.hashing import hash_canonical, is_sha256_digest
 
 
 def _hash_text(value: object) -> str:
@@ -35,6 +35,7 @@ class ModelSignature:
     tokenizer_hash: str
     chat_template_hash: str
     generation_config_hash: str
+    configuration_hash: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.schema_version, bool) or self.schema_version != 1:
@@ -49,15 +50,17 @@ class ModelSignature:
             "chat_template_hash",
             "generation_config_hash",
         ):
-            if not str(getattr(self, name)).startswith("sha256:"):
+            if not is_sha256_digest(getattr(self, name)):
                 raise ValueError(f"{name} must be a tagged SHA-256 digest")
+        if self.configuration_hash is not None and not is_sha256_digest(self.configuration_hash):
+            raise ValueError("configuration_hash must be a tagged SHA-256 digest")
 
     @property
     def signature_hash(self) -> str:
         return hash_canonical(self.to_dict())
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "adapter_id": self.adapter_id,
             "architecture_hash": self.architecture_hash,
             "chat_template_hash": self.chat_template_hash,
@@ -67,6 +70,9 @@ class ModelSignature:
             "state_schema_hash": self.state_schema_hash,
             "tokenizer_hash": self.tokenizer_hash,
         }
+        if self.configuration_hash is not None:
+            result["configuration_hash"] = self.configuration_hash
+        return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> ModelSignature:
@@ -86,7 +92,10 @@ class ModelSignature:
             if not isinstance(item, expected):
                 raise ValueError(f"invalid model signature field: {key}")
             parsed[key] = item
-        return cls(**parsed)
+        configuration_hash = value.get("configuration_hash")
+        if configuration_hash is not None and not isinstance(configuration_hash, str):
+            raise ValueError("invalid model signature field: configuration_hash")
+        return cls(**parsed, configuration_hash=configuration_hash)
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,9 +199,12 @@ def build_model_manifest(
 
     schema = inspect_state_schema(model)
     checkpoint_hash, tensor_hashes = checkpoint_tensor_fingerprint(checkpoint)
-    config = (
-        architecture_config if architecture_config is not None else canonical_config(checkpoint)
-    )
+    checkpoint_config = canonical_config(checkpoint)
+    # A persisted checkpoint configuration is the canonical identity source so
+    # rescanning the same checkpoint cannot depend on an optional caller hint.
+    # The explicit configuration remains useful for bare tensor files and
+    # checkpoint directories that do not carry config.json.
+    config = checkpoint_config or architecture_config or {}
     architecture_hash = _hash_text(
         {
             "adapter_id": adapter_id,
@@ -209,6 +221,7 @@ def build_model_manifest(
         tokenizer_hash=tokenizer_fingerprint(checkpoint),
         chat_template_hash=chat_template_fingerprint(checkpoint),
         generation_config_hash=generation_config_fingerprint(checkpoint),
+        configuration_hash=hash_canonical(config),
     )
     parameters = list(model.parameters())
     parameter_count = sum(parameter.numel() for parameter in parameters)

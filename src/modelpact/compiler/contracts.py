@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +15,7 @@ from modelpact.compiler.constraints import DifferentiableConstraint, Differentia
 from modelpact.contracts.ast import AssertionType, BehaviorContract, CompileObjective, ObjectiveType
 from modelpact.contracts.objectives import ObjectiveInputs, evaluate_objective
 from modelpact.contracts.parser import resolve_contract_resource
+from modelpact.util.canonical_json import CanonicalJSONError, strict_json_loads
 from modelpact.util.hashing import sha256_file
 
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
@@ -113,8 +113,8 @@ def load_compilation_records(
             if len(line.encode("utf-8")) > MAX_RECORD_BYTES:
                 raise ContractPreparationError(f"line {line_number}: record exceeds size limit")
             try:
-                value = json.loads(line)
-            except json.JSONDecodeError as error:
+                value = strict_json_loads(line)
+            except CanonicalJSONError as error:
                 raise ContractPreparationError(f"line {line_number}: malformed JSON") from error
             if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
                 raise ContractPreparationError(f"line {line_number}: record must be an object")
@@ -399,7 +399,7 @@ def prepare_contract(
                 specification.id,
                 examples,
                 _objective_loss(adapter, specification),
-                weight=1.0,
+                weight=specification.weight,
             )
         )
     guards: list[DifferentiableConstraint] = []

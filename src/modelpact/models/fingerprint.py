@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
 from modelpact.checkpoints.safetensors import DEFAULT_MAX_FILE_BYTES, tensor_content_hash
 from modelpact.checkpoints.store import checkpoint_files
+from modelpact.util.canonical_json import strict_json_loads
 from modelpact.util.hashing import hash_canonical, sha256_file
 
 MAX_CONFIG_BYTES = 16 * 1024**2
@@ -30,7 +30,7 @@ def _bounded_json(path: Path) -> Any:
         raise ValueError(f"expected regular configuration file: {path}")
     if path.stat().st_size > MAX_CONFIG_BYTES:
         raise ValueError(f"configuration file exceeds size limit: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    return strict_json_loads(path.read_bytes())
 
 
 def canonical_config(checkpoint: str | Path) -> Mapping[str, object]:
@@ -46,6 +46,12 @@ def canonical_config(checkpoint: str | Path) -> Mapping[str, object]:
     # Location and private cache details are not architecture semantics.
     excluded = {"_name_or_path", "transformers_version", "torch_dtype"}
     return {key: value[key] for key in sorted(value) if key not in excluded}
+
+
+def configuration_fingerprint(checkpoint: str | Path) -> str:
+    """Fingerprint the canonical, location-independent model configuration."""
+
+    return hash_canonical(canonical_config(checkpoint))
 
 
 def checkpoint_tensor_fingerprint(checkpoint: str | Path) -> tuple[str, dict[str, str]]:

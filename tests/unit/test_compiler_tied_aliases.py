@@ -64,9 +64,10 @@ def test_tied_alias_optimization_matches_packaged_runtime_semantics() -> None:
     assert result.metadata["optimized_aliases"] == {
         "lm_head": ["lm_head.weight", "token_embedding.weight"]
     }
-    # One left and one right Parameter are optimized.  Alias views do not add
+    # The scalar factor parameter count is r(m+n). Alias views do not add
     # duplicate optimizer entries.
-    assert result.metadata["trainable_factor_parameters"] == 2
+    left, right = result.factors["lm_head"]
+    assert result.metadata["trainable_factor_parameters"] == left.numel() + right.numel()
     assert result.best_target_loss is not None
 
     schema = inspect_state_schema(base)

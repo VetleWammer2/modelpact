@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from pathlib import Path
 
 from modelpact.models.manifest import ModelSignature
 from modelpact.patch.ast import DeltaProgram
+from modelpact.util.canonical_json import CanonicalJSONError, strict_json_loads
 
 MAX_DELTA_PROGRAM_BYTES = 16 * 1024**2
 BASE_IDENTITY_FIELDS = (
@@ -28,8 +28,8 @@ def load_delta_program(path: str | Path) -> DeltaProgram:
     if source.stat().st_size > MAX_DELTA_PROGRAM_BYTES:
         raise ValueError("delta program exceeds size limit")
     try:
-        value = json.loads(source.read_text(encoding="utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        value = strict_json_loads(source.read_bytes())
+    except (CanonicalJSONError, RecursionError) as error:
         raise ValueError("malformed delta program JSON") from error
     if not isinstance(value, Mapping):
         raise ValueError("delta program must be a JSON object")

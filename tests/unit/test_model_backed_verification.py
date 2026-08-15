@@ -93,6 +93,47 @@ def test_model_provider_computes_logits_base_and_reference_distributions(tmp_pat
     assert provider.probe_hashes["probes.jsonl"].startswith("sha256:")
 
 
+def test_model_provider_uses_content_hashed_reference_logits_without_teacher(
+    tmp_path: Path,
+) -> None:
+    adapter = TinyModelAdapter()
+    torch.manual_seed(17)
+    model = TinyCausalLM(
+        TinyConfig(
+            max_sequence_length=64,
+            hidden_size=8,
+            intermediate_size=16,
+            num_layers=1,
+            num_heads=2,
+        )
+    )
+    prompt = "abc"
+    batch = adapter.tokenizer().batch((prompt,), add_bos=True)
+    with torch.no_grad():
+        logits = adapter.forward_logits(model, batch)[0]
+    length = int(batch.attention_mask[0].sum().item())
+    reference = logits[:length].detach().cpu()
+    write_jsonl(
+        tmp_path / "probes.jsonl",
+        [{"id": "p", "prompt": prompt, "reference_logits": reference.tolist()}],
+    )
+    provider = ModelBackedRecordProvider(
+        adapter=adapter,
+        model=model,
+        contract_root=tmp_path,
+        generation_policy=GenerationPolicy(max_new_tokens=1, seeds=(0,)),
+    )
+
+    records = provider.records_for(
+        spec(AssertionType.REFERENCE_KL, maximum_mean=0.1),
+        source="probes.jsonl",
+        role=VerificationRole.TARGET,
+        holdout_capability=None,
+    )
+
+    torch.testing.assert_close(records[0].reference_logits, reference)
+
+
 def test_model_provider_scores_choices_with_real_forward_passes(tmp_path: Path) -> None:
     write_jsonl(
         tmp_path / "probes.jsonl",

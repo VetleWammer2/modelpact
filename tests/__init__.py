@@ -1,0 +1,1 @@
+"""ModelPact test package."""

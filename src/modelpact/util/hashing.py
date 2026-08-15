@@ -9,6 +9,18 @@ from pathlib import Path
 from modelpact.util.canonical_json import canonical_json_bytes
 
 CHUNK_SIZE = 1024 * 1024
+SHA256_TAGGED_LENGTH = 71
+
+
+def is_sha256_digest(value: object) -> bool:
+    """Return whether *value* is exactly ``sha256:`` plus 64 lowercase hex digits."""
+
+    return (
+        isinstance(value, str)
+        and len(value) == SHA256_TAGGED_LENGTH
+        and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
 
 
 def _tag(digest: str) -> str:

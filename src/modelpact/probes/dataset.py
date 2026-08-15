@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from modelpact.util.canonical_json import CanonicalJSONError, strict_json_loads
 from modelpact.util.hashing import hash_canonical
 
 MAX_JSONL_BYTES = 64 * 1024 * 1024
@@ -104,8 +104,8 @@ def load_jsonl(
             if len(line.encode("utf-8")) > MAX_LINE_BYTES:
                 raise ProbeDataError(f"line {line_number}: record is too large")
             try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
+                record = strict_json_loads(line)
+            except CanonicalJSONError as error:
                 raise ProbeDataError(f"line {line_number}: malformed JSON") from error
             probe = _validate_record(record, line_number=line_number, default_role=default_role)
             if probe.role is ProbeRole.HOLDOUT and not allow_holdout:

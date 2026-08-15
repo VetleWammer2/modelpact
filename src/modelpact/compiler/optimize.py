@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
@@ -21,7 +22,7 @@ from modelpact.compiler.constraints import (
     augmented_penalty,
     mean_loss,
 )
-from modelpact.compiler.initialize import gradient_initializer
+from modelpact.compiler.initialize import gradient_initializer, target_delta_initializer
 from modelpact.compiler.result import CompilationResult, CompilationStatus, StepEvidence
 from modelpact.models.aliases import discover_parameter_aliases
 from modelpact.util.seeds import seed_everything
@@ -120,14 +121,35 @@ def _install_parameterizations(
     guards: tuple[DifferentiableConstraint, ...],
     config: OptimizerConfig,
     alias_targets: dict[str, tuple[str, ...]],
-) -> dict[str, AdditiveLowRankParametrization]:
+    target_state: Mapping[str, Tensor] | None,
+) -> tuple[dict[str, AdditiveLowRankParametrization], dict[str, dict[str, object]]]:
     modules = patchable_linear_weights(model)
     parameterizations: dict[str, AdditiveLowRankParametrization] = {}
+    initialization_evidence: dict[str, dict[str, object]] = {}
     for offset, name in enumerate(selected):
         module = modules[name]
         rank = min(config.maximum_rank, *module.weight.shape)
-        gradient = contrastive_gradient_matrix(model, module, objectives, guards)
-        initialized = gradient_initializer(gradient, rank=rank, seed=config.seed + offset)
+        if target_state is None:
+            gradient = contrastive_gradient_matrix(model, module, objectives, guards)
+            initialized = gradient_initializer(gradient, rank=rank, seed=config.seed + offset)
+        else:
+            parameter_name = f"{name}.weight"
+            target_weight = target_state.get(parameter_name)
+            if target_weight is None:
+                raise ValueError(
+                    f"target-delta initializer is missing target parameter: {parameter_name}"
+                )
+            initialized = target_delta_initializer(
+                module.weight.detach(),
+                target_weight.detach().to(device=module.weight.device, dtype=module.weight.dtype),
+                rank=rank,
+                seed=config.seed + offset,
+            )
+        initialization_evidence[name] = {
+            "rank": rank,
+            "source": initialized.source,
+            "source_norm": initialized.source_norm,
+        }
         parameterization = AdditiveLowRankParametrization(
             initialized.left.to(device=module.weight.device, dtype=module.weight.dtype),
             initialized.right.to(device=module.weight.device, dtype=module.weight.dtype),
@@ -151,7 +173,7 @@ def _install_parameterizations(
                 unsafe=False,
             )
         parameterizations[name] = parameterization
-    return parameterizations
+    return parameterizations, initialization_evidence
 
 
 def _snapshot(
@@ -173,12 +195,44 @@ def _restore(
             parameterizations[name].right.copy_(right)
 
 
+def _evaluate_candidate(
+    model: nn.Module,
+    objectives: tuple[DifferentiableObjective, ...],
+    guards: tuple[DifferentiableConstraint, ...],
+    parameterizations: dict[str, AdditiveLowRankParametrization],
+) -> tuple[dict[str, float], dict[str, float], float]:
+    """Evaluate the exact currently mounted factors without updating state."""
+
+    with torch.no_grad():
+        target_values = {
+            objective.objective_id: float(
+                (mean_loss(model, objective.batches, objective.loss) * objective.weight).item()
+            )
+            for objective in objectives
+        }
+        guard_values = {
+            guard.constraint_id: float(
+                (mean_loss(model, guard.batches, guard.measure) - guard.maximum).item()
+            )
+            for guard in guards
+        }
+        complexity = float(
+            torch.stack(
+                [item.effective_delta.square().sum() for item in parameterizations.values()]
+            )
+            .sum()
+            .item()
+        )
+    return target_values, guard_values, complexity
+
+
 def compile_low_rank_patch(
     base_model: nn.Module,
     objectives: tuple[DifferentiableObjective, ...],
     guards: tuple[DifferentiableConstraint, ...],
     *,
     config: OptimizerConfig = DEFAULT_OPTIMIZER_CONFIG,
+    target_state: Mapping[str, Tensor] | None = None,
 ) -> CompilationResult:
     """Compile a real additive low-rank patch on a private model copy.
 
@@ -220,13 +274,14 @@ def compile_low_rank_patch(
         )
     alias_targets = _resolve_alias_targets(model, ranked_selected)
     selected = tuple(alias_targets)
-    parameterizations = _install_parameterizations(
+    parameterizations, initialization_evidence = _install_parameterizations(
         model,
         selected,
         objectives,
         guards,
         config,
         alias_targets,
+        target_state,
     )
     trainable = [
         parameter for item in parameterizations.values() for parameter in item.parameters()
@@ -243,7 +298,14 @@ def compile_low_rank_patch(
     best_step: int | None = None
     best_loss = float("inf")
     stale_steps = 0
-    last_violations: dict[str, float] = {}
+    initial_targets, initial_guards, _ = _evaluate_candidate(
+        model, objectives, guards, parameterizations
+    )
+    last_violations = initial_guards
+    if all(value <= 0 for value in initial_guards.values()):
+        best_snapshot = _snapshot(parameterizations)
+        best_step = -1
+        best_loss = sum(initial_targets.values())
     for step in range(config.steps):
         optimizer.zero_grad(set_to_none=True)
         target_values = {
@@ -269,13 +331,10 @@ def compile_low_rank_patch(
             torch.nn.utils.clip_grad_norm_(trainable, config.gradient_clip).item()
         )
         optimizer.step()
-        numeric_guards = {
-            identifier: float(value.detach().item()) for identifier, value in guard_values.items()
-        }
+        numeric_target, numeric_guards, numeric_complexity = _evaluate_candidate(
+            model, objectives, guards, parameterizations
+        )
         feasible = all(value <= 0 for value in numeric_guards.values())
-        numeric_target = {
-            identifier: float(value.detach().item()) for identifier, value in target_values.items()
-        }
         numeric_total = sum(numeric_target.values())
         for identifier, numeric_violation in numeric_guards.items():
             multipliers[identifier].update(numeric_violation)
@@ -286,7 +345,7 @@ def compile_low_rank_patch(
                 guard_margins=numeric_guards,
                 multipliers={identifier: state.value for identifier, state in multipliers.items()},
                 gradient_norm=gradient_norm,
-                patch_norm=float(patch_complexity.detach().sqrt().item()),
+                patch_norm=numeric_complexity**0.5,
                 feasible=feasible,
             )
         )
@@ -307,20 +366,22 @@ def compile_low_rank_patch(
             "No candidate satisfied every declared differentiable constraint within the "
             "optimization budget."
         ]
+        final_violations = last_violations
     else:
         _restore(parameterizations, best_snapshot)
         snapshot = best_snapshot
-        status = CompilationStatus.FEASIBLE
-        warnings = []
-        restored_target_values = {
-            objective.objective_id: float(
-                (mean_loss(model, objective.batches, objective.loss) * objective.weight)
-                .detach()
-                .item()
-            )
-            for objective in objectives
-        }
+        restored_target_values, final_violations, _ = _evaluate_candidate(
+            model, objectives, guards, parameterizations
+        )
         best_loss = sum(restored_target_values.values())
+        if all(value <= 0 for value in final_violations.values()):
+            status = CompilationStatus.FEASIBLE
+            warnings = []
+        else:
+            status = CompilationStatus.INFEASIBLE_WITHIN_BUDGET
+            warnings = [
+                "The selected candidate failed exact guard re-evaluation after restoration."
+            ]
     deltas = {name: left @ right for name, (left, right) in snapshot.items()}
     return CompilationResult(
         status=status,
@@ -330,18 +391,20 @@ def compile_low_rank_patch(
         ranks={name: left.shape[1] for name, (left, _) in snapshot.items()},
         evidence=history,
         best_step=best_step,
-        best_target_loss=None if best_snapshot is None else best_loss,
-        violated_constraints={name: value for name, value in last_violations.items() if value > 0},
+        best_target_loss=best_loss if status is CompilationStatus.FEASIBLE else None,
+        violated_constraints={name: value for name, value in final_violations.items() if value > 0},
         warnings=warnings,
         metadata={
             "optimizer": "AdamW",
             "primal_dual": True,
             "rho": config.rho,
             "seed": config.seed,
+            "initial_candidate_evaluated": True,
+            "initialization": initialization_evidence,
             "optimized_aliases": {
                 name: list(alias_targets[name]) for name in sorted(alias_targets)
             },
-            "trainable_factor_parameters": len(trainable),
+            "trainable_factor_parameters": sum(parameter.numel() for parameter in trainable),
             "module_evidence": [
                 {
                     "module_name": item.module_name,

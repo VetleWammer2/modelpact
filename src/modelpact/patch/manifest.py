@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from modelpact.models.manifest import ModelSignature
-from modelpact.util.hashing import hash_canonical
+from modelpact.util.hashing import hash_canonical, is_sha256_digest
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,9 +36,9 @@ class PatchManifest:
             raise ValueError("invalid patch name")
         if self.delta_representation != "additive_low_rank_sparse_v1":
             raise ValueError(f"unsupported delta representation: {self.delta_representation}")
-        if self.patch_id and not self.patch_id.startswith("sha256:"):
+        if self.patch_id and not is_sha256_digest(self.patch_id):
             raise ValueError("patch_id must be a tagged SHA-256 digest")
-        if not self.target_module_schema_hash.startswith("sha256:"):
+        if not is_sha256_digest(self.target_module_schema_hash):
             raise ValueError("target_module_schema_hash must be a tagged SHA-256 digest")
         signature = ModelSignature.from_dict(self.base_signature)
         if signature.state_schema_hash != self.target_module_schema_hash:
@@ -52,6 +52,13 @@ class PatchManifest:
         ):
             if tuple(sorted(set(collection))) != collection:
                 raise ValueError("manifest identity lists must be unique and sorted")
+        for name, values in (
+            ("provides", self.provides),
+            ("preserves", self.preserves),
+            ("requires", self.requires),
+        ):
+            if any(not is_sha256_digest(value) for value in values):
+                raise ValueError(f"{name} must contain contract SHA-256 identities")
         for path, digest in self.artifact_hashes.items():
             if (
                 not isinstance(path, str)
@@ -61,8 +68,24 @@ class PatchManifest:
                 or ".." in path.replace("\\", "/").split("/")
             ):
                 raise ValueError(f"unsafe artifact path: {path}")
-            if not digest.startswith("sha256:"):
+            if not is_sha256_digest(digest):
                 raise ValueError(f"invalid artifact digest: {path}")
+        if self.verification_policy_hash is not None and not is_sha256_digest(
+            self.verification_policy_hash
+        ):
+            raise ValueError("verification_policy_hash must be a tagged SHA-256 digest")
+        for name, values in (
+            ("parent_patches", self.parent_patches),
+            ("merged_from", self.merged_from),
+        ):
+            if any(not is_sha256_digest(value) for value in values):
+                raise ValueError(f"{name} must contain tagged SHA-256 digests")
+        for name, value in (
+            ("rebased_from", self.rebased_from),
+            ("source_diff_bundle", self.source_diff_bundle),
+        ):
+            if value is not None and not is_sha256_digest(value):
+                raise ValueError(f"{name} must be a tagged SHA-256 digest")
 
     def _payload(self, *, identity_only: bool) -> dict[str, object]:
         artifact_hashes = self.artifact_hashes
@@ -100,6 +123,28 @@ class PatchManifest:
         """Return the stable patch-ID input, excluding post-ID evidence artifacts."""
 
         return self._payload(identity_only=True)
+
+    def evidence_payload(self) -> dict[str, object]:
+        """Return the immutable evidence-bearing identity pinned by emitted tools.
+
+        Generated helpers and the certificate are excluded because they embed
+        the core patch identity. All executable contracts, probes, evidence,
+        reports, deltas, and tensors are included.
+        """
+
+        return {
+            "artifact_hashes": {
+                path: digest
+                for path, digest in sorted(self.artifact_hashes.items())
+                if path not in {"apply_patch.py", "verify_patch.py", "certificate.json"}
+            },
+            "patch_id": self.patch_id,
+            "schema_version": 1,
+        }
+
+    @property
+    def evidence_id(self) -> str:
+        return hash_canonical(self.evidence_payload())
 
     def computed_patch_id(self) -> str:
         return hash_canonical(self.identity_payload())
