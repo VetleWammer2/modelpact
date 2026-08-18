@@ -22,6 +22,13 @@ from modelpact import __version__
 from modelpact.contracts.assertions import AssertionEvaluation
 from modelpact.contracts.ast import AssertionType, BehaviorContract, VerificationAssertion
 from modelpact.contracts.parser import ContractLimits, loads_data
+from modelpact.rebase.evidence import (
+    MAX_REBASE_EVIDENCE_BYTES,
+    RebaseEvidenceExpectations,
+    read_rebase_evidence,
+    rebase_evidence_from_dict,
+    validate_rebase_evidence,
+)
 from modelpact.status import (
     AuditClaim,
     CompositionClaim,
@@ -32,7 +39,7 @@ from modelpact.status import (
 from modelpact.util.atomic import atomic_write_text
 from modelpact.util.canonical_json import canonical_dumps
 from modelpact.util.hashing import hash_canonical, is_sha256_digest, sha256_file
-from modelpact.util.paths import resolve_inside, safe_relative_path
+from modelpact.util.paths import resolve_inside, safe_relative_path, validate_relative_paths
 from modelpact.verify.engine import VerificationReport
 
 _CERTIFICATE_LIMITS = ContractLimits(
@@ -46,12 +53,11 @@ _CERTIFICATE_LIMITS = ContractLimits(
 )
 _MAX_CERTIFICATE_ARTIFACTS = 10_000
 _MAX_CERTIFICATE_ARTIFACT_BYTES = 512 * 1024**2
+_MAX_CERTIFICATE_MANIFEST_BYTES = 16 * 1024**2
 _MAX_CERTIFICATE_TENSOR_BYTES = 16 * 1024**3
 _MAX_CERTIFICATE_AGGREGATE_BYTES = _MAX_CERTIFICATE_TENSOR_BYTES + _MAX_CERTIFICATE_ARTIFACT_BYTES
 _ALLOWED_CLAIMS = frozenset(
-    item.value
-    for enum_type in (PatchClaim, CompositionClaim, RebaseClaim, AuditClaim)
-    for item in enum_type
+    item.value for enum_type in (PatchClaim, CompositionClaim, AuditClaim) for item in enum_type
 )
 
 
@@ -518,6 +524,80 @@ def _string_tuple(data: Mapping[str, object], name: str) -> tuple[str, ...]:
     return tuple(cast(list[str], value))
 
 
+_REBASE_RESULT_FIELDS = frozenset(
+    {
+        "claim",
+        "evidence",
+        "new_base_guard_ids",
+        "source_base_hash",
+        "source_patch_id",
+        "target_base_hash",
+    }
+)
+
+
+def _rebase_result(data: Mapping[str, object]) -> Mapping[str, object]:
+    value = _mapping(data, "rebase_result")
+    if value == {"outcome": VerificationOutcome.NOT_APPLICABLE.value}:
+        return {"outcome": VerificationOutcome.NOT_APPLICABLE.value}
+    unknown = set(value) - _REBASE_RESULT_FIELDS
+    missing = _REBASE_RESULT_FIELDS - set(value)
+    if unknown:
+        raise CertificateError(f"unknown rebase_result field(s): {sorted(unknown)}")
+    if missing:
+        raise CertificateError(f"missing rebase_result field(s): {sorted(missing)}")
+    source_patch_id = _required_string(value, "source_patch_id")
+    source_base_hash = _required_string(value, "source_base_hash")
+    target_base_hash = _required_string(value, "target_base_hash")
+    for name, digest in (
+        ("rebase_result.source_patch_id", source_patch_id),
+        ("rebase_result.source_base_hash", source_base_hash),
+        ("rebase_result.target_base_hash", target_base_hash),
+    ):
+        _validate_hash(digest, name)
+    claim_text = _required_string(value, "claim")
+    try:
+        claim = RebaseClaim(claim_text)
+    except ValueError as error:
+        raise CertificateError(f"unsupported rebase_result claim: {claim_text!r}") from error
+    if claim not in {
+        RebaseClaim.DIRECT_TRANSPLANT_VERIFIED,
+        RebaseClaim.SEMANTIC_REBASE_VERIFIED,
+    }:
+        raise CertificateIntegrityError("a bundled rebase certificate must carry a verified claim")
+    raw_guards = value.get("new_base_guard_ids")
+    if not isinstance(raw_guards, list) or not all(isinstance(item, str) for item in raw_guards):
+        raise CertificateError("rebase_result.new_base_guard_ids must contain strings")
+    guards = tuple(cast(list[str], raw_guards))
+    if tuple(sorted(set(guards))) != guards:
+        raise CertificateError("rebase_result.new_base_guard_ids must be sorted and unique")
+    raw_evidence = value.get("evidence")
+    if not isinstance(raw_evidence, Mapping):
+        raise CertificateError("rebase_result.evidence must be an object")
+    evidence = rebase_evidence_from_dict(cast(Mapping[str, object], raw_evidence))
+    validate_rebase_evidence(
+        evidence,
+        expectations=RebaseEvidenceExpectations(
+            source_patch_id=source_patch_id,
+            source_base_hash=source_base_hash,
+            target_base_hash=target_base_hash,
+            claim=claim,
+        ),
+    )
+    if not set(guards).issubset(evidence.new_base_preservation):
+        raise CertificateIntegrityError(
+            "rebase_result.new_base_guard_ids are not present in the preservation evidence"
+        )
+    return {
+        "claim": claim.value,
+        "evidence": evidence.to_dict(),
+        "new_base_guard_ids": list(guards),
+        "source_base_hash": source_base_hash,
+        "source_patch_id": source_patch_id,
+        "target_base_hash": target_base_hash,
+    }
+
+
 def _validate_hash(value: str, name: str) -> None:
     if not is_sha256_digest(value):
         raise CertificateError(f"{name} must be a lowercase sha256: digest")
@@ -532,7 +612,11 @@ def certificate_from_dict(value: Mapping[str, object]) -> VerificationCertificat
         raise CertificateError("unknown certificate field(s): " + ", ".join(sorted(unknown)))
     if missing:
         raise CertificateError("missing certificate field(s): " + ", ".join(sorted(missing)))
-    if value.get("schema_version") != 1:
+    # `1.0 == 1` and `True == 1` in Python, so compare the type as well. A float
+    # spelling would otherwise parse while the dataclass normalizes it back to
+    # an int, leaving certificate_hash addressing a payload the reader no longer
+    # reproduces.
+    if type(value.get("schema_version")) is not int or value.get("schema_version") != 1:
         raise CertificateError("only Verification Certificate schema_version 1 is supported")
     outcome_text = _required_string(value, "verification_outcome")
     try:
@@ -557,8 +641,13 @@ def certificate_from_dict(value: Mapping[str, object]) -> VerificationCertificat
     }
     for name, digest in hashes.items():
         _validate_hash(digest, name)
-    for path in artifact_hashes:
-        safe_relative_path(path)
+    validate_relative_paths(
+        artifact_hashes,
+        reserved_paths=(
+            "evidence/rebase.json",
+            "evidence/source-manifest.json",
+        ),
+    )
     claims = _string_tuple(value, "claims")
     unsupported_claims = _string_tuple(value, "unsupported_claims")
     unknown_claims = (set(claims) | set(unsupported_claims)) - _ALLOWED_CLAIMS
@@ -604,7 +693,7 @@ def certificate_from_dict(value: Mapping[str, object]) -> VerificationCertificat
         minimization_result=_mapping(value, "minimization_result"),
         composition_result=_mapping(value, "composition_result"),
         interaction_diagnostics=_mapping(value, "interaction_diagnostics"),
-        rebase_result=_mapping(value, "rebase_result"),
+        rebase_result=_rebase_result(value),
         environment_identity=_mapping(value, "environment_identity"),
         artifact_hashes=artifact_hashes,
         verification_outcome=outcome,
@@ -919,6 +1008,44 @@ def _prompt_level_metrics_are_consistent(certificate: VerificationCertificate) -
 
 
 def _validate_claim_evidence(certificate: VerificationCertificate) -> None:
+    has_rebase_result = certificate.rebase_result != {
+        "outcome": VerificationOutcome.NOT_APPLICABLE.value
+    }
+    has_rebase_artifact = "evidence/rebase.json" in certificate.artifact_hashes
+    has_source_manifest = "evidence/source-manifest.json" in certificate.artifact_hashes
+    # The security-relevant direction only: asserting a rebase requires pinning
+    # both lineage artifacts. The converse would break honest re-certification,
+    # because independently_verify rebuilds a certificate from re-executed
+    # contracts and does not re-derive the rebase; it reports the absent
+    # rebase_result as a prior-certificate difference instead.
+    if has_rebase_result and not (has_rebase_artifact and has_source_manifest):
+        raise CertificateIntegrityError(
+            "rebase_result requires pinned evidence/rebase.json and "
+            "evidence/source-manifest.json artifacts"
+        )
+    if has_rebase_result:
+        # rebase_result records the packaging-time rebase lineage, not this
+        # execution's verdict. Coupling it to PASS would make a FAIL certificate
+        # unrepresentable for a rebased bundle, so re-verifying one that no
+        # longer satisfies its contracts would error instead of reporting FAIL.
+        # The execution verdict is verification_outcome; RebaseClaim values are
+        # not admissible in claims, so a non-PASS certificate asserts nothing.
+        target_base_hash = certificate.rebase_result.get("target_base_hash")
+        if target_base_hash != certificate.base_signature:
+            raise CertificateIntegrityError(
+                "rebase_result target base does not match the certificate base signature"
+            )
+        raw_evidence = certificate.rebase_result.get("evidence")
+        assert isinstance(raw_evidence, Mapping)
+        evidence = rebase_evidence_from_dict(cast(Mapping[str, object], raw_evidence))
+        evidence_contracts = set(evidence.new_patched_behavior) | {
+            identifier.removesuffix(":guards") for identifier in evidence.new_base_preservation
+        }
+        certificate_contracts = set(certificate.contract_hashes.values())
+        if not evidence_contracts.issubset(certificate_contracts):
+            raise CertificateIntegrityError(
+                "rebase_result contract identities do not match certificate contract hashes"
+            )
     claims = set(certificate.claims)
     holdout_assertions = _holdout_evidence(certificate)
     all_assertions = (
@@ -1100,11 +1227,14 @@ def validate_certificate(
             path = resolve_inside(artifact_root, relative)
             if not path.is_file():
                 raise CertificateIntegrityError(f"referenced artifact is missing: {relative}")
-            limit = (
-                _MAX_CERTIFICATE_TENSOR_BYTES
-                if relative.endswith(".safetensors")
-                else _MAX_CERTIFICATE_ARTIFACT_BYTES
-            )
+            if relative == "evidence/rebase.json":
+                limit = MAX_REBASE_EVIDENCE_BYTES
+            elif relative == "evidence/source-manifest.json":
+                limit = _MAX_CERTIFICATE_MANIFEST_BYTES
+            elif relative.endswith(".safetensors"):
+                limit = _MAX_CERTIFICATE_TENSOR_BYTES
+            else:
+                limit = _MAX_CERTIFICATE_ARTIFACT_BYTES
             size = path.stat().st_size
             if size > limit:
                 raise CertificateIntegrityError(
@@ -1120,6 +1250,109 @@ def validate_certificate(
                 raise CertificateIntegrityError(
                     f"artifact hash mismatch for {relative}: "
                     f"declared {declared_hash}, observed {observed_hash}"
+                )
+        if "evidence/rebase.json" in reparsed.artifact_hashes:
+            if reparsed.rebase_result == {"outcome": VerificationOutcome.NOT_APPLICABLE.value}:
+                raise CertificateIntegrityError(
+                    "certificate references Rebase Evidence but has no rebase_result"
+                )
+            nested_value = reparsed.rebase_result.get("evidence")
+            assert isinstance(nested_value, Mapping)
+            nested = rebase_evidence_from_dict(cast(Mapping[str, object], nested_value))
+            from modelpact.patch.bundle import (
+                REBASE_EVIDENCE_PATH,
+                REBASE_SOURCE_MANIFEST_PATH,
+                is_executable_contract_path,
+                validate_contract_artifacts,
+                validate_rebase_evidence_artifact,
+            )
+            from modelpact.patch.manifest import PatchManifest
+
+            manifest_path = root / "manifest.json"
+            if manifest_path.is_symlink() or not manifest_path.is_file():
+                raise CertificateIntegrityError(
+                    "artifact-root validation of a rebase certificate requires manifest.json"
+                )
+            if manifest_path.stat().st_size > _MAX_CERTIFICATE_MANIFEST_BYTES:
+                raise CertificateIntegrityError("patch manifest exceeds the size limit")
+            manifest_raw = manifest_path.read_bytes()
+            manifest_value = loads_data(
+                manifest_raw,
+                format="json",
+                limits=ContractLimits(
+                    max_bytes=_MAX_CERTIFICATE_MANIFEST_BYTES,
+                    max_depth=16,
+                    max_nodes=150_000,
+                    max_string_length=4_096,
+                    max_object_keys=10_000,
+                    max_objectives=1,
+                    max_assertions=1,
+                ),
+                require_canonical=True,
+            )
+            if not isinstance(manifest_value, Mapping):
+                raise CertificateIntegrityError("patch manifest must be an object")
+            manifest = PatchManifest.from_dict(manifest_value)
+            manifest.validate_identity()
+            canonical_manifest = canonical_dumps(manifest.to_dict()).encode("utf-8")
+            if manifest_raw not in {canonical_manifest, canonical_manifest + b"\n"}:
+                raise CertificateIntegrityError(
+                    "patch manifest is not the exact canonical v1 representation"
+                )
+            if manifest.patch_id != reparsed.patch_id:
+                raise CertificateIntegrityError(
+                    "patch manifest identity does not match the certificate patch_id"
+                )
+            relevant_manifest_artifacts = {
+                relative: digest
+                for relative, digest in manifest.artifact_hashes.items()
+                if relative in {REBASE_EVIDENCE_PATH, REBASE_SOURCE_MANIFEST_PATH}
+                or is_executable_contract_path(relative)
+            }
+            relevant_certificate_artifacts = {
+                relative: digest
+                for relative, digest in reparsed.artifact_hashes.items()
+                if relative in {REBASE_EVIDENCE_PATH, REBASE_SOURCE_MANIFEST_PATH}
+                or is_executable_contract_path(relative)
+            }
+            if relevant_manifest_artifacts != relevant_certificate_artifacts:
+                raise CertificateIntegrityError(
+                    "certificate contract/rebase artifacts do not match the patch manifest"
+                )
+            # The certificate is written before its own file and the generated
+            # helpers are attached, so its artifact set is a subset of the
+            # manifest's. Every shared path must still agree, or the
+            # identity-bearing delta artifacts could diverge from the manifest
+            # that defines patch_id while this validation still passed.
+            divergent = sorted(
+                relative
+                for relative, digest in reparsed.artifact_hashes.items()
+                if relative in manifest.artifact_hashes
+                and manifest.artifact_hashes[relative] != digest
+            )
+            if divergent:
+                raise CertificateIntegrityError(
+                    "certificate and patch manifest disagree on artifact digests: "
+                    + ", ".join(divergent)
+                )
+            try:
+                validate_contract_artifacts(root, manifest)
+                validate_rebase_evidence_artifact(root, manifest)
+            except ValueError as error:
+                raise CertificateIntegrityError(str(error)) from error
+            artifact_evidence = read_rebase_evidence(
+                resolve_inside(artifact_root, "evidence/rebase.json"),
+                expectations=RebaseEvidenceExpectations(
+                    evidence_hash=nested.evidence_hash,
+                    source_patch_id=cast(str, reparsed.rebase_result["source_patch_id"]),
+                    source_base_hash=cast(str, reparsed.rebase_result["source_base_hash"]),
+                    target_base_hash=cast(str, reparsed.rebase_result["target_base_hash"]),
+                    claim=nested.claim,
+                ),
+            )
+            if artifact_evidence.to_dict() != nested.to_dict():
+                raise CertificateIntegrityError(
+                    "certificate rebase_result differs from evidence/rebase.json"
                 )
 
 

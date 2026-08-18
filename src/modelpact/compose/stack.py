@@ -5,12 +5,28 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
+from types import MappingProxyType
 from typing import Protocol, cast
 
+from modelpact.contracts.parser import ContractLimits, loads_data, validate_data_shape
 from modelpact.util.hashing import is_sha256_digest
 
+MAX_STACK_LOCK_BYTES = 16 * 1024**2
 MAX_STACK_LOCK_PATCHES = 4_096
 MAX_STACK_LOCK_CONTRACTS = 100_000
+MAX_STACK_LOCK_NODES = 150_000
+MAX_STACK_LOCK_STRING_LENGTH = 4_096
+MAX_STACK_LOCK_OBJECT_KEYS = 10_000
+STACK_LOCK_LIMITS = ContractLimits(
+    max_bytes=MAX_STACK_LOCK_BYTES,
+    max_depth=16,
+    max_nodes=MAX_STACK_LOCK_NODES,
+    max_string_length=MAX_STACK_LOCK_STRING_LENGTH,
+    max_object_keys=MAX_STACK_LOCK_OBJECT_KEYS,
+    max_objectives=1,
+    max_assertions=1,
+)
 STACK_LOCK_FIELDS = frozenset(
     {
         "audit_hash",
@@ -74,7 +90,7 @@ class PatchReference:
     def provided_contracts(self) -> tuple[str, ...]:
         """Contracts capable of satisfying another patch's requirements."""
 
-        return self.provides or self.contract_hashes
+        return self.provides
 
 
 class StackResolutionKind(StrEnum):
@@ -134,6 +150,68 @@ class StackLock:
     certificate_hash: str | None
     audit_hash: str | None
 
+    def __post_init__(self) -> None:
+        if isinstance(self.schema_version, bool) or type(self.schema_version) is not int:
+            raise ValueError("unsupported Patch Stack Lockfile schema version")
+        if self.schema_version != 1:
+            raise ValueError("unsupported Patch Stack Lockfile schema version")
+        if not isinstance(self.resolution, StackResolutionKind):
+            raise ValueError("lockfile resolution must be a StackResolutionKind")
+        for name, digest in (
+            ("base_hash", self.base_hash),
+            ("verification_policy_hash", self.verification_policy_hash),
+        ):
+            if not is_sha256_digest(digest):
+                raise ValueError(f"lockfile {name} must be a tagged SHA-256 digest")
+        if not isinstance(self.patch_hashes, Mapping):
+            raise ValueError("lockfile patch_hashes must be an object")
+        if len(self.patch_hashes) > MAX_STACK_LOCK_PATCHES:
+            raise ValueError("lockfile patch count exceeds the limit")
+        patch_hashes: dict[str, str] = {}
+        for patch_id, manifest_hash in self.patch_hashes.items():
+            if not is_sha256_digest(patch_id) or not is_sha256_digest(manifest_hash):
+                raise ValueError(
+                    "lockfile patch_hashes must map patch SHA-256 identities to "
+                    "manifest SHA-256 digests"
+                )
+            patch_hashes[patch_id] = manifest_hash
+        object.__setattr__(
+            self,
+            "patch_hashes",
+            MappingProxyType(dict(sorted(patch_hashes.items()))),
+        )
+        if not isinstance(self.contract_hashes, tuple):
+            raise ValueError("lockfile contract_hashes must be a tuple")
+        if len(self.contract_hashes) > MAX_STACK_LOCK_CONTRACTS:
+            raise ValueError("lockfile contract count exceeds the limit")
+        if not all(is_sha256_digest(item) for item in self.contract_hashes):
+            raise ValueError("lockfile contract_hashes must contain tagged SHA-256 digests")
+        if tuple(sorted(set(self.contract_hashes))) != self.contract_hashes:
+            raise ValueError("lockfile contract_hashes must be sorted and unique")
+        if not patch_hashes and self.contract_hashes:
+            raise ValueError("an empty stack cannot claim contracts")
+        for name, optional_digest in (
+            ("resolved_artifact_hash", self.resolved_artifact_hash),
+            ("certificate_hash", self.certificate_hash),
+            ("audit_hash", self.audit_hash),
+        ):
+            if optional_digest is not None and not is_sha256_digest(optional_digest):
+                raise ValueError(f"lockfile {name} must be null or a tagged SHA-256 digest")
+        successful = self.resolution in {
+            StackResolutionKind.NAIVE_ADDITIVE_STACK,
+            StackResolutionKind.VERIFIED_COMPOSITE_PATCH,
+        }
+        if successful and self.resolved_artifact_hash is None:
+            raise ValueError("successful lockfile resolution must pin a resolved artifact")
+        if successful and patch_hashes and self.certificate_hash is None:
+            raise ValueError("successful nonempty stack must pin a verification certificate")
+        if not successful and (
+            self.resolved_artifact_hash is not None or self.certificate_hash is not None
+        ):
+            raise ValueError("unsuccessful lockfile resolution cannot pin a resolved artifact")
+        if not patch_hashes and successful and self.resolved_artifact_hash != self.base_hash:
+            raise ValueError("an empty successful stack must resolve to its pinned base")
+
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
@@ -153,13 +231,14 @@ class StackLock:
     def from_dict(cls, value: Mapping[str, object]) -> StackLock:
         """Strictly parse the data-only core of Patch Stack Lockfile v1."""
 
+        validate_data_shape(value, limits=STACK_LOCK_LIMITS)
         unknown = set(value) - STACK_LOCK_FIELDS
         missing = STACK_LOCK_FIELDS - set(value)
         if unknown:
             raise ValueError(f"unknown Patch Stack Lockfile v1 fields: {sorted(unknown)}")
         if missing:
             raise ValueError(f"missing Patch Stack Lockfile v1 fields: {sorted(missing)}")
-        if isinstance(value.get("schema_version"), bool) or value.get("schema_version") != 1:
+        if type(value.get("schema_version")) is not int or value.get("schema_version") != 1:
             raise ValueError("unsupported Patch Stack Lockfile schema version")
 
         def required_digest(name: str) -> str:
@@ -229,6 +308,31 @@ class StackLock:
             certificate_hash=optional_digest("certificate_hash"),
             audit_hash=optional_digest("audit_hash"),
         )
+
+
+def loads_stack_lock(text: str | bytes) -> StackLock:
+    """Parse a canonical, bounded core Patch Stack Lockfile v1 record."""
+
+    value = loads_data(
+        text,
+        format="json",
+        limits=STACK_LOCK_LIMITS,
+        require_canonical=True,
+    )
+    if not isinstance(value, Mapping):
+        raise ValueError("Patch Stack Lockfile root must be an object")
+    return StackLock.from_dict(cast(Mapping[str, object], value))
+
+
+def read_stack_lock(path: str | Path) -> StackLock:
+    """Read a regular non-symlink core Patch Stack Lockfile v1 record."""
+
+    source = Path(path)
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("stack lockfile must be a regular file")
+    if source.stat().st_size > MAX_STACK_LOCK_BYTES:
+        raise ValueError("stack lockfile exceeds size limit")
+    return loads_stack_lock(source.read_bytes())
 
 
 @dataclass(frozen=True, slots=True)

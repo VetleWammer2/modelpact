@@ -30,7 +30,12 @@ from safetensors.torch import save_file
 from torch import Tensor, nn
 
 from modelpact import __version__
-from modelpact.compose.stack import STACK_LOCK_FIELDS, StackLock
+from modelpact.compose.stack import (
+    MAX_STACK_LOCK_BYTES,
+    STACK_LOCK_FIELDS,
+    STACK_LOCK_LIMITS,
+    StackLock,
+)
 from modelpact.loading import load_trusted_adapter, parse_dtype
 from modelpact.models.manifest import ModelManifest, build_model_manifest
 from modelpact.models.schema import ModelStateSchema
@@ -1132,6 +1137,19 @@ def verify_command(
         union_report, union_contract, contract_hashes, verification_policy = _certificate_union(
             reports, contract_entries
         )
+        rebase_result: Mapping[str, object] | None = None
+        if "evidence/rebase.json" in bundle.manifest.artifact_hashes:
+            from modelpact.rebase.evidence import read_rebase_evidence
+
+            rebase_evidence = read_rebase_evidence(bundle.path / "evidence" / "rebase.json")
+            rebase_result = {
+                "claim": rebase_evidence.claim.value,
+                "evidence": rebase_evidence.to_dict(),
+                "new_base_guard_ids": [],
+                "source_base_hash": rebase_evidence.source_base_hash,
+                "source_patch_id": rebase_evidence.source_patch_id,
+                "target_base_hash": rebase_evidence.target_base_hash,
+            }
         certificate = build_certificate(
             union_report,
             union_contract,
@@ -1144,6 +1162,7 @@ def verify_command(
                 "active_targets": sorted(bundle.program.targets),
                 "patch_bytes": bundle.program.estimate_bytes(bundle.tensors),
             },
+            rebase_result=rebase_result,
             additional_warnings=(
                 "Certificate was regenerated from model execution; bundled outcomes "
                 "were not trusted.",
@@ -5112,6 +5131,41 @@ def rebase_command(
             packaging_context,
             include_holdout_resources=True,
         )
+        retargeted_ids: dict[str, str] = {
+            identifier: cast(str, contract.contract_id)
+            for identifier, (contract, _path) in retargeted_contracts.items()
+        }
+
+        def packaged_reference(identifier: str) -> str:
+            suffix = ":guards"
+            if identifier.endswith(suffix):
+                source_identifier = identifier[: -len(suffix)]
+                return f"{retargeted_ids[source_identifier]}{suffix}"
+            return retargeted_ids[identifier]
+
+        packaged_target_margins = {
+            packaged_reference(identifier): margin
+            for identifier, margin in result.evidence.new_patched_behavior.items()
+        }
+        packaged_guard_margins = {
+            packaged_reference(identifier): margin
+            for identifier, margin in result.evidence.new_base_preservation.items()
+        }
+        if len(packaged_target_margins) != len(result.evidence.new_patched_behavior) or len(
+            packaged_guard_margins
+        ) != len(result.evidence.new_base_preservation):
+            raise ValueError("retargeted contract identities collide in Rebase Evidence")
+        result = dataclasses.replace(
+            result,
+            evidence=dataclasses.replace(
+                result.evidence,
+                new_patched_behavior=packaged_target_margins,
+                new_base_preservation=packaged_guard_margins,
+            ),
+        )
+        packaged_new_base_guard_ids = tuple(
+            packaged_reference(identifier) for identifier in new_base_guard_ids
+        )
         compilation_evidence = {
             "cegis": cegis_evidence,
             "direct_transplant": not semantic,
@@ -5150,6 +5204,9 @@ def rebase_command(
                 ).encode(),
                 "evidence/rebase.json": (
                     canonical_dumps(result.evidence.to_dict()) + "\n"
+                ).encode(),
+                "evidence/source-manifest.json": (
+                    canonical_dumps(bundle.manifest.to_dict()) + "\n"
                 ).encode(),
                 "evidence/validation.json": (
                     canonical_dumps({"contracts": validation_evidence, "schema_version": 1}) + "\n"
@@ -5239,7 +5296,7 @@ def rebase_command(
                 "source_patch_id": bundle.manifest.patch_id,
                 "target_base_hash": target.manifest.signature.signature_hash,
                 "evidence": result.evidence.to_dict(),
-                "new_base_guard_ids": list(new_base_guard_ids),
+                "new_base_guard_ids": list(packaged_new_base_guard_ids),
             },
         )
         codegen_root = Path(tempfile.mkdtemp(prefix="modelpact-codegen-"))
@@ -5829,9 +5886,9 @@ def resolve_command(
     _invoke(operation, compact=json_output)
 
 
-_MAX_STACK_LOCK_BYTES = 16 * 1024**2
 _MAX_STACK_LOCK_PATH_CHARS = 4_096
 _MAX_STACK_MANIFEST_AGGREGATE_BYTES = 512 * 1024**2
+MAX_STACK_LOCK_ARTIFACT_REFERENCES = 100_000
 _CLI_LOCK_EXTENSION_FIELDS = frozenset(
     {
         "base_manifest_hash",
@@ -5859,6 +5916,8 @@ class _ParsedStackLock:
 
 
 def _absolute_lock_path(value: object, *, field_name: str) -> Path:
+    from modelpact.util.paths import safe_relative_path
+
     if (
         not isinstance(value, str)
         or not value
@@ -5866,6 +5925,8 @@ def _absolute_lock_path(value: object, *, field_name: str) -> Path:
         or "\x00" in value
     ):
         raise ValueError(f"lockfile {field_name} is empty, oversized, or contains NUL")
+    if "\\" in value:
+        raise ValueError(f"lockfile {field_name} must use canonical POSIX path syntax")
     normalized = value.replace("\\", "/")
     if normalized.startswith("//"):
         raise ValueError(f"lockfile {field_name} must not use a UNC or network path")
@@ -5875,6 +5936,16 @@ def _absolute_lock_path(value: object, *, field_name: str) -> Path:
     candidate = Path(value)
     if not candidate.is_absolute():
         raise ValueError(f"lockfile {field_name} must be an absolute local path")
+    relative_parts = candidate.parts[1:]
+    if relative_parts:
+        try:
+            safe_relative_path("/".join(relative_parts))
+        except ValueError as error:
+            raise ValueError(
+                f"lockfile {field_name} contains a non-portable path component"
+            ) from error
+    if value != candidate.as_posix() or value != candidate.resolve(strict=False).as_posix():
+        raise ValueError(f"lockfile {field_name} must use canonical POSIX path syntax")
     return candidate
 
 
@@ -5937,11 +6008,18 @@ def _parse_cli_lock_extension(
 
 
 def _read_lock(path: Path) -> _ParsedStackLock:
+    from modelpact.contracts.parser import loads_data
+
     if path.is_symlink() or not path.is_file():
         raise ValueError("stack lockfile must be a regular file")
-    if path.stat().st_size > _MAX_STACK_LOCK_BYTES:
+    if path.stat().st_size > MAX_STACK_LOCK_BYTES:
         raise ValueError("stack lockfile exceeds size limit")
-    value = strict_json_loads(path.read_bytes(), max_depth=16)
+    value = loads_data(
+        path.read_bytes(),
+        format="json",
+        limits=STACK_LOCK_LIMITS,
+        require_canonical=True,
+    )
     if not isinstance(value, Mapping):
         raise ValueError("malformed Patch Stack Lockfile v1")
     allowed = STACK_LOCK_FIELDS | {"extensions"}
@@ -5969,17 +6047,64 @@ def _read_lock(path: Path) -> _ParsedStackLock:
 def _verify_locked_patch_manifests(parsed: _ParsedStackLock) -> None:
     """Bound and authenticate every locked manifest before loading the base model."""
 
-    from modelpact.patch.bundle import MAX_MANIFEST_BYTES
+    from modelpact.compose.stack import (
+        PatchLineage,
+        PatchReference,
+        StackResolutionKind,
+        dependency_order,
+    )
+    from modelpact.contracts.parser import DEFAULT_LIMITS, loads_contract, loads_data
+    from modelpact.models.manifest import ModelSignature
+    from modelpact.patch.bundle import (
+        MAX_BUNDLE_ARTIFACTS,
+        MAX_MANIFEST_BYTES,
+        REBASE_EVIDENCE_PATH,
+        REBASE_SOURCE_MANIFEST_PATH,
+        bundle_artifact_size_limit,
+        is_executable_contract_path,
+        validate_rebase_evidence_artifact,
+    )
+    from modelpact.patch.manifest import PatchManifest
+    from modelpact.verify.certificate import (
+        CertificateExpectations,
+        loads_certificate,
+        validate_certificate,
+    )
 
     if parsed.extension is None:
         return
+
+    def reject_symlinks(path: Path, *, description: str) -> None:
+        for component in (path, *path.parents):
+            if component.is_symlink():
+                raise ValueError(f"locked {description} must not traverse a symlink")
+
+    reject_symlinks(parsed.extension.base_path, description="base path")
+    successful = parsed.lock.resolution in {
+        StackResolutionKind.NAIVE_ADDITIVE_STACK,
+        StackResolutionKind.VERIFIED_COMPOSITE_PATCH,
+    }
+    resolved_path = parsed.extension.resolved_patch_path
+    if successful and parsed.lock.patch_hashes and resolved_path is None:
+        raise ValueError("successful nonempty stack is missing its resolved patch path")
+    if not successful and resolved_path is not None:
+        raise ValueError("unsuccessful stack must not carry a resolved patch path")
+
+    normalized_paths = [
+        path.resolve(strict=False) for path in parsed.extension.patch_paths.values()
+    ]
+    if len(set(normalized_paths)) != len(normalized_paths):
+        raise ValueError("locked patch paths must be unique")
+
     bounded: list[tuple[str, Path, str]] = []
     aggregate = 0
     for patch_id, expected in sorted(parsed.lock.patch_hashes.items()):
         bundle_path = parsed.extension.patch_paths[patch_id]
+        reject_symlinks(bundle_path, description=f"patch path for {patch_id}")
         if bundle_path.is_symlink() or not bundle_path.is_dir():
             raise ValueError(f"locked patch path is not a regular directory: {patch_id}")
         manifest_path = bundle_path / "manifest.json"
+        reject_symlinks(manifest_path, description=f"patch manifest for {patch_id}")
         if manifest_path.is_symlink() or not manifest_path.is_file():
             raise ValueError(f"locked patch manifest is not a regular file: {patch_id}")
         size = manifest_path.stat().st_size
@@ -5989,10 +6114,291 @@ def _verify_locked_patch_manifests(parsed: _ParsedStackLock) -> None:
         if aggregate > _MAX_STACK_MANIFEST_AGGREGATE_BYTES:
             raise ValueError("locked patch manifests exceed the aggregate size limit")
         bounded.append((patch_id, manifest_path, expected))
+
+    resolved_manifest_path: Path | None = None
+    if resolved_path is not None:
+        reject_symlinks(resolved_path, description="resolved patch path")
+        if resolved_path.is_symlink() or not resolved_path.is_dir():
+            raise ValueError("locked resolved patch path is not a regular directory")
+        resolved_manifest_path = resolved_path / "manifest.json"
+        reject_symlinks(resolved_manifest_path, description="resolved patch manifest")
+        if resolved_manifest_path.is_symlink() or not resolved_manifest_path.is_file():
+            raise ValueError("locked resolved patch manifest is not a regular file")
+        size = resolved_manifest_path.stat().st_size
+        if size > MAX_MANIFEST_BYTES:
+            raise ValueError("locked resolved patch manifest exceeds the size limit")
+        aggregate += size
+        if aggregate > _MAX_STACK_MANIFEST_AGGREGATE_BYTES:
+            raise ValueError("locked patch manifests exceed the aggregate size limit")
+
+    parsed_manifests: list[tuple[str, Path, str, PatchManifest, ModelSignature]] = []
+    expected_base_signature: Mapping[str, object] | None = None
+    artifact_references = 0
     for patch_id, manifest_path, expected in bounded:
         actual = sha256_file(manifest_path, max_bytes=MAX_MANIFEST_BYTES)
         if actual != expected:
             raise ValueError(f"locked patch manifest changed: {patch_id}")
+        manifest_bytes = manifest_path.read_bytes()
+        if sha256_bytes(manifest_bytes) != actual:
+            raise ValueError(f"locked patch manifest changed while reading: {patch_id}")
+        raw_manifest = loads_data(
+            manifest_bytes,
+            format="json",
+            limits=STACK_LOCK_LIMITS,
+            require_canonical=True,
+        )
+        if not isinstance(raw_manifest, Mapping):
+            raise ValueError(f"locked patch manifest must be an object: {patch_id}")
+        manifest = PatchManifest.from_dict(raw_manifest)
+        manifest.validate_identity()
+        if manifest.patch_id != patch_id:
+            raise ValueError(f"locked patch identity does not match patch_id key: {patch_id}")
+        signature = ModelSignature.from_dict(manifest.base_signature)
+        if signature.checkpoint_hash != parsed.lock.base_hash:
+            raise ValueError(f"locked patch base does not match stack base: {patch_id}")
+        if expected_base_signature is None:
+            expected_base_signature = signature.to_dict()
+        elif signature.to_dict() != expected_base_signature:
+            raise ValueError("locked patches disagree on their full base signature")
+        if len(manifest.artifact_hashes) > MAX_BUNDLE_ARTIFACTS:
+            raise ValueError(f"locked patch references too many artifacts: {patch_id}")
+        artifact_references += len(manifest.artifact_hashes)
+        if artifact_references > MAX_STACK_LOCK_ARTIFACT_REFERENCES:
+            raise ValueError("locked stack exceeds the aggregate artifact reference limit")
+        parsed_manifests.append((patch_id, manifest_path, actual, manifest, signature))
+
+    resolved_manifest: PatchManifest | None = None
+    resolved_signature: ModelSignature | None = None
+    if resolved_manifest_path is not None:
+        expected_resolved = parsed.lock.resolved_artifact_hash
+        if expected_resolved is None:
+            raise ValueError("resolved patch path has no pinned resolved artifact hash")
+        actual_resolved = sha256_file(
+            resolved_manifest_path,
+            max_bytes=MAX_MANIFEST_BYTES,
+        )
+        if actual_resolved != expected_resolved:
+            raise ValueError("locked resolved patch manifest changed")
+        resolved_manifest_bytes = resolved_manifest_path.read_bytes()
+        if sha256_bytes(resolved_manifest_bytes) != actual_resolved:
+            raise ValueError("locked resolved patch manifest changed while reading")
+        raw_resolved = loads_data(
+            resolved_manifest_bytes,
+            format="json",
+            limits=STACK_LOCK_LIMITS,
+            require_canonical=True,
+        )
+        if not isinstance(raw_resolved, Mapping):
+            raise ValueError("locked resolved patch manifest must be an object")
+        resolved_manifest = PatchManifest.from_dict(raw_resolved)
+        resolved_manifest.validate_identity()
+        resolved_signature = ModelSignature.from_dict(resolved_manifest.base_signature)
+        if resolved_signature.checkpoint_hash != parsed.lock.base_hash:
+            raise ValueError("locked resolved patch base does not match stack base")
+        if (
+            expected_base_signature is not None
+            and resolved_signature.to_dict() != expected_base_signature
+        ):
+            raise ValueError("locked resolved patch has a different full base signature")
+        if len(resolved_manifest.artifact_hashes) > MAX_BUNDLE_ARTIFACTS:
+            raise ValueError("locked resolved patch references too many artifacts")
+        artifact_references += len(resolved_manifest.artifact_hashes)
+        if artifact_references > MAX_STACK_LOCK_ARTIFACT_REFERENCES:
+            raise ValueError("locked stack exceeds the aggregate artifact reference limit")
+
+    def validate_embedded_records(
+        manifest_path: Path,
+        manifest: PatchManifest,
+        *,
+        label: str,
+    ) -> tuple[str, ...]:
+        nonlocal aggregate
+
+        for relative in (REBASE_EVIDENCE_PATH, REBASE_SOURCE_MANIFEST_PATH):
+            if relative not in manifest.artifact_hashes:
+                continue
+            artifact_path = manifest_path.parent / Path(relative)
+            reject_symlinks(artifact_path, description=f"{label} {relative}")
+            if artifact_path.is_symlink() or not artifact_path.is_file():
+                raise ValueError(f"locked {label} rebase artifact is not a regular file")
+            limit = bundle_artifact_size_limit(relative)
+            size = artifact_path.stat().st_size
+            if size > limit:
+                raise ValueError(f"locked {label} rebase artifact exceeds the size limit")
+            aggregate += size
+            if aggregate > _MAX_STACK_MANIFEST_AGGREGATE_BYTES:
+                raise ValueError("locked patch records exceed the aggregate byte limit")
+        try:
+            validate_rebase_evidence_artifact(manifest_path.parent, manifest)
+        except ValueError as error:
+            raise ValueError(f"locked {label} Rebase Evidence is invalid: {error}") from error
+
+        embedded_contracts: dict[str, object] = {}
+        embedded_targets: set[str] = set()
+        embedded_guards: set[str] = set()
+        for relative, declared_hash in sorted(manifest.artifact_hashes.items()):
+            if not is_executable_contract_path(relative):
+                continue
+            contract_path = manifest_path.parent / Path(relative)
+            reject_symlinks(contract_path, description=f"contract artifact for {label}")
+            if contract_path.is_symlink() or not contract_path.is_file():
+                raise ValueError(f"locked {label} contract is not a regular file")
+            contract_size = contract_path.stat().st_size
+            if contract_size > DEFAULT_LIMITS.max_bytes:
+                raise ValueError(f"locked {label} contract exceeds the size limit")
+            aggregate += contract_size
+            if aggregate > _MAX_STACK_MANIFEST_AGGREGATE_BYTES:
+                raise ValueError("locked patch manifests and contracts exceed the aggregate limit")
+            actual_contract_hash = sha256_file(
+                contract_path,
+                max_bytes=DEFAULT_LIMITS.max_bytes,
+            )
+            if actual_contract_hash != declared_hash:
+                raise ValueError(f"locked {label} contract artifact changed")
+            contract_bytes = contract_path.read_bytes()
+            if sha256_bytes(contract_bytes) != actual_contract_hash:
+                raise ValueError(f"locked {label} contract changed while reading")
+            contract = loads_contract(
+                contract_bytes,
+                format=Path(relative).suffix,
+                limits=DEFAULT_LIMITS,
+            )
+            prior = embedded_contracts.get(contract.contract_id)
+            if prior is not None and prior != contract.to_dict():
+                raise ValueError(f"locked {label} has a contract identity collision")
+            embedded_contracts[contract.contract_id] = contract.to_dict()
+            if contract.targets:
+                embedded_targets.add(contract.contract_id)
+            if contract.guards:
+                embedded_guards.add(contract.contract_id)
+        if tuple(sorted(embedded_targets)) != manifest.provides:
+            raise ValueError(f"locked {label} contract roles (targets) do not match its manifest")
+        if tuple(sorted(embedded_guards)) != manifest.preserves:
+            raise ValueError(f"locked {label} contract roles (guards) do not match its manifest")
+        return tuple(sorted(embedded_contracts))
+
+    references: list[PatchReference] = []
+    expected_provides: set[str] = set()
+    expected_preserves: set[str] = set()
+    expected_requires: set[str] = set()
+    for patch_id, manifest_path, actual, manifest, signature in parsed_manifests:
+        contract_hashes = validate_embedded_records(
+            manifest_path,
+            manifest,
+            label=f"patch {patch_id}",
+        )
+        expected_provides.update(manifest.provides)
+        expected_preserves.update(manifest.preserves)
+        expected_requires.update(manifest.requires)
+        references.append(
+            PatchReference(
+                patch_id=manifest.patch_id,
+                patch_hash=actual,
+                base_hash=signature.checkpoint_hash,
+                contract_hashes=contract_hashes,
+                artifact_hash=hash_canonical(dict(manifest.artifact_hashes)),
+                requires=manifest.requires,
+                provides=manifest.provides,
+                lineage=PatchLineage(
+                    parent_patches=manifest.parent_patches,
+                    merged_from=manifest.merged_from,
+                    rebased_from=manifest.rebased_from,
+                    source_diff=manifest.source_diff_bundle,
+                ),
+            )
+        )
+
+    claimed_contracts = tuple(
+        sorted({identifier for reference in references for identifier in reference.contract_hashes})
+    )
+    if claimed_contracts != parsed.lock.contract_hashes:
+        raise ValueError("locked contract identities do not match patch manifests")
+    if dependency_order(references) != parsed.extension.dependency_order:
+        raise ValueError("locked dependency order does not match patch manifest requirements")
+
+    if resolved_manifest_path is not None:
+        assert resolved_manifest is not None
+        assert resolved_signature is not None
+        resolved_contract_hashes = validate_embedded_records(
+            resolved_manifest_path,
+            resolved_manifest,
+            label="resolved patch",
+        )
+        if resolved_contract_hashes != claimed_contracts:
+            raise ValueError("locked resolved patch contracts do not match stack contracts")
+        if resolved_manifest.provides != tuple(sorted(expected_provides)):
+            raise ValueError("locked resolved patch contract roles do not match the stack")
+        if resolved_manifest.preserves != tuple(sorted(expected_preserves)):
+            raise ValueError("locked resolved patch contract roles do not match the stack")
+        if resolved_manifest.requires != tuple(sorted(expected_requires)):
+            raise ValueError("locked resolved patch requirements do not match the stack")
+        if resolved_manifest.parent_patches != tuple(sorted(parsed.lock.patch_hashes)):
+            raise ValueError("locked resolved patch lineage does not match stack members")
+        expected_merged_from = (
+            tuple(sorted(parsed.lock.patch_hashes))
+            if parsed.lock.resolution is StackResolutionKind.VERIFIED_COMPOSITE_PATCH
+            else ()
+        )
+        if (
+            resolved_manifest.merged_from != expected_merged_from
+            or resolved_manifest.rebased_from is not None
+            or resolved_manifest.source_diff_bundle is not None
+        ):
+            raise ValueError("locked resolved patch lineage contradicts the resolution kind")
+
+        certificate_path = resolved_manifest_path.parent / "certificate.json"
+        reject_symlinks(certificate_path, description="resolved patch certificate")
+        if certificate_path.is_symlink() or not certificate_path.is_file():
+            raise ValueError("locked resolved patch certificate is not a regular file")
+        certificate_size = certificate_path.stat().st_size
+        if certificate_size > MAX_MANIFEST_BYTES:
+            raise ValueError("locked resolved patch certificate exceeds the size limit")
+        aggregate += certificate_size
+        if aggregate > _MAX_STACK_MANIFEST_AGGREGATE_BYTES:
+            raise ValueError("locked patch manifests and certificate exceed the aggregate limit")
+        declared_certificate_file_hash = resolved_manifest.artifact_hashes.get("certificate.json")
+        if declared_certificate_file_hash is None:
+            raise ValueError("locked resolved patch manifest does not pin certificate.json")
+        actual_certificate_file_hash = sha256_file(
+            certificate_path,
+            max_bytes=MAX_MANIFEST_BYTES,
+        )
+        if actual_certificate_file_hash != declared_certificate_file_hash:
+            raise ValueError("locked resolved patch certificate file changed")
+        certificate_bytes = certificate_path.read_bytes()
+        if sha256_bytes(certificate_bytes) != actual_certificate_file_hash:
+            raise ValueError("locked resolved patch certificate changed while reading")
+        certificate = loads_certificate(certificate_bytes)
+        canonical_certificate = canonical_dumps(certificate.to_dict()).encode("utf-8")
+        if certificate_bytes not in {
+            canonical_certificate,
+            canonical_certificate + b"\n",
+        }:
+            raise ValueError("locked resolved patch certificate is not canonical JSON")
+        validate_certificate(
+            certificate,
+            expectations=CertificateExpectations(
+                certificate_hash=parsed.lock.certificate_hash,
+                patch_id=resolved_manifest.patch_id,
+                base_signature=resolved_signature.signature_hash,
+            ),
+        )
+        if set(certificate.contract_hashes.values()) != set(parsed.lock.contract_hashes):
+            raise ValueError("locked resolved patch certificate contracts do not match the stack")
+        # Pinning a certificate is not the same as pinning a passing one. Without
+        # this, a lockfile can claim a resolved, verified stack while the only
+        # verification evidence it pins records that the composite failed.
+        if certificate.verification_outcome is not VerificationOutcome.PASS:
+            raise ValueError("locked successful resolution pins a non-passing certificate")
+        expected_certificate_artifacts = {
+            path: digest
+            for path, digest in resolved_manifest.artifact_hashes.items()
+            if path not in {"apply_patch.py", "certificate.json", "verify_patch.py"}
+        }
+        if dict(certificate.artifact_hashes) != expected_certificate_artifacts:
+            raise ValueError(
+                "locked resolved patch certificate artifacts do not match its manifest"
+            )
 
 
 @app.command("revert")

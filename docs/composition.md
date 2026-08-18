@@ -34,3 +34,21 @@ bundle manifest hashes. `repair_conflicts = true` invokes the tiny semantic
 merge backend only after naïve closure fails and uses the same CEGIS and
 minimization path as `modelpact merge`; unsupported adapter backends fail
 honestly instead of emitting an unusable raw delta.
+
+Stack lockfiles are hostile canonical JSON, not trusted execution plans. The
+reader rejects duplicate keys, noncanonical bytes, unknown/missing fields,
+malformed hashes, excessive depth/counts/paths, duplicate members, invalid
+resolution state, and path/dependency maps that do not exactly cover the locked
+patch set. Before `revert` loads the base model, referenced-manifest preflight
+rejects traversal, symlinks, non-portable path aliases, and case-insensitive path
+collisions. It bounds and authenticates every input and resolved manifest, then
+strictly parses their rebase/source-manifest lineage records and executable
+target/guard contracts before model loading. The resolved certificate is also
+parsed and checked against the resolved manifest and stack identities. Preflight
+recomputes full-base, contract-role, dependency, resolution, and lineage
+consistency; input and resolved manifests together are limited to 100,000
+artifact references and their parsed records share the documented aggregate byte
+limit. Thus changing and recanonicalizing a lock cannot substitute a different
+valid bundle under an old patch ID. A core lock without local path metadata
+cannot by itself authenticate external artifacts; its consumer must supply and
+validate those references.

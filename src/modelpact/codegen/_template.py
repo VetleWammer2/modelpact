@@ -30,7 +30,7 @@ import sys
 import tempfile
 import unicodedata
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import torch
@@ -70,6 +70,12 @@ MAX_SUM_TERMS = 4096
 MAX_RECORDS = 100_000
 MAX_TEXT = 1_000_000
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+WINDOWS_RESERVED_NAMES = frozenset(
+    {"aux", "con", "nul", "prn"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+)
+WINDOWS_FORBIDDEN_PATH_CHARACTERS = frozenset('<>:"|?*')
 
 AUXILIARY_FILES = frozenset(
     {
@@ -240,13 +246,25 @@ def _finite(value: object, context: str, *, default: float | None = None) -> flo
 
 def _safe_relative(value: object, context: str = "path") -> str:
     text = _string(value, context)
-    normalized = text.replace("\\", "/")
-    pure = PurePosixPath(normalized)
+    pure = PurePosixPath(text)
+    windows = PureWindowsPath(text)
+    unsafe_component = any(
+        part.endswith((".", " "))
+        or part.split(".", maxsplit=1)[0].casefold() in WINDOWS_RESERVED_NAMES
+        or any(character in WINDOWS_FORBIDDEN_PATH_CHARACTERS for character in part)
+        or any(ord(character) < 32 for character in part)
+        for part in pure.parts
+    )
     if (
-        normalized.startswith("/")
-        or Path(text).is_absolute()
-        or Path(text).drive
+        "\\" in text
+        or text.startswith("/")
+        or pure.is_absolute()
+        or pure.drive
+        or windows.is_absolute()
+        or bool(windows.drive)
         or any(part in {"", ".", ".."} for part in pure.parts)
+        or pure.as_posix() != text
+        or unsafe_component
     ):
         raise ToolError(f"unsafe relative {context}: {text}")
     return pure.as_posix()
@@ -382,6 +400,16 @@ def _validate_manifest(value: object) -> dict[str, object]:
         item = manifest.get(field)
         if item is not None and not isinstance(item, str):
             raise ToolError(f"{field} must be a string or null")
+    parents = set(manifest["parent_patches"])
+    merged = set(manifest["merged_from"])
+    rebased_from = manifest["rebased_from"]
+    source_diff = manifest["source_diff_bundle"]
+    if not merged.issubset(parents):
+        raise ToolError("merged_from must be a subset of parent_patches")
+    if rebased_from is not None and (parents or merged or source_diff is not None):
+        raise ToolError("rebase lineage cannot be combined with other lineage modes")
+    if source_diff is not None and (parents or merged or rebased_from is not None):
+        raise ToolError("source-diff lineage cannot be combined with patch-parent lineage")
     base = _mapping(manifest.get("base_signature"), "base_signature")
     _exact_fields(
         base,
@@ -411,8 +439,21 @@ def _validate_manifest(value: object) -> dict[str, object]:
     artifacts = _mapping(manifest.get("artifact_hashes"), "artifact_hashes")
     if len(artifacts) > MAX_TENSORS:
         raise ToolError("artifact hash map exceeds limit")
+    seen_artifact_paths: dict[str, str] = {}
+    reserved_artifact_paths = {
+        "evidence/rebase.json",
+        "evidence/source-manifest.json",
+    }
     for relative, digest in artifacts.items():
-        _safe_relative(relative, "artifact path")
+        safe = _safe_relative(relative, "artifact path")
+        folded = safe.casefold()
+        prior = seen_artifact_paths.get(folded)
+        if prior is not None and prior != safe:
+            raise ToolError("artifact paths collide on a case-insensitive filesystem")
+        for reserved in reserved_artifact_paths:
+            if folded == reserved.casefold() and safe != reserved:
+                raise ToolError(f"reserved artifact path has noncanonical spelling: {safe}")
+        seen_artifact_paths[folded] = safe
         if not isinstance(digest, str) or DIGEST_RE.fullmatch(digest) is None:
             raise ToolError(f"invalid artifact digest: {relative}")
     if not {"delta-program.json", "tensors.safetensors"}.issubset(artifacts):

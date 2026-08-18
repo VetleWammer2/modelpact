@@ -13,16 +13,30 @@ an authoring format only; identity is computed after parsing into the normalized
 JSON data model.
 
 Unknown-field policy is artifact-specific. Behavior Contract, Delta Program,
-Patch Manifest, and Verification Certificate readers reject unknown fields.
-The current Model Manifest/State Schema readers validate the fields they use but
-tolerate additional fields, and the stack/rebase records do not yet have a
-dedicated normative hostile-data parser. A reader never interprets an unknown
-`schema_version` as v1; command surfaces report unsupported versions as an
-error/non-success state.
+Patch Manifest, Verification Certificate, Rebase Evidence, and Patch Stack
+Lockfile readers reject unknown fields in their closed schemas. The current
+Model Manifest/State Schema readers validate the fields they use but tolerate
+additional fields. A reader never interprets an unknown `schema_version` as v1;
+command surfaces report unsupported versions as an error/non-success state.
+
+The Rebase Evidence and on-disk Patch Stack Lockfile readers require the input
+bytes to be exactly the ModelPact canonical JSON encoding, optionally followed
+by the single LF emitted by ModelPact writers. They do not silently normalize a
+BOM, CRLF, insignificant whitespace, alternate escapes, key order, number
+spelling, or trailing content. Duplicate keys and non-finite numbers are rejected
+before schema construction.
 
 Paths embedded in bundles and verification resources are bundle-relative POSIX
-paths without `.` or `..`, drive names, absolute roots, NULs, or symlink
-traversal. A user-selected CLI output path is not an embedded artifact path.
+paths in one exact portable spelling. Readers reject backslashes; empty, `.` or
+`..` components; drive, UNC, or absolute roots; NUL/control characters; Windows
+reserved device-name stems; alternate-data-stream colons and other characters
+forbidden in Windows names; and components ending in a dot or space. A path set
+MUST NOT contain spellings that collide after Unicode case folding, and fixed
+reserved artifact paths MUST use their specified case. Resolution MUST NOT
+traverse a symlink. A user-selected CLI output path is not an embedded artifact
+path, although local paths serialized in the CLI stack-lock extension are also
+required to use canonical, portable POSIX syntax.
+
 Readers impose artifact-specific bounds on file sizes, tensor dimensions,
 expression depth, collection counts, and integers before the corresponding
 allocation. Patch data cannot contain Python, callables, pickle, or an
@@ -230,6 +244,14 @@ After calculation the core ID is inserted and validated by recomputing the same
 canonical payload. Parent, merge, and dependency lists are sorted where order
 is not semantic.
 
+A bundle whose manifest has `rebased_from` MUST list both the bare canonical
+`evidence/rebase.json` record and a canonical
+`evidence/source-manifest.json`. The latter is a complete, self-validating Patch
+Manifest v1 for the source patch. Its `patch_id`, full base signature, and
+`provides` set bind the Rebase Evidence source patch, source base, and old
+target-contract identities. A non-rebased bundle MUST NOT carry either reserved
+rebase-lineage artifact.
+
 Bundle mounting validates the base signature, module schema, alias groups,
 tensor keys, shapes, and dtypes. Unknown operations or state are refused.
 Mounting a second ModelPact patch on an already mounted model is rejected.
@@ -300,9 +322,24 @@ fetches a missing patch or model.
 unsupported resolution values, duplicate/unsorted contract identities, and
 oversized patch or contract collections. The CLI envelope admits only the
 documented `modelpact_cli` extension, bounds absolute local paths, requires path
-and dependency maps to cover the locked patch set exactly, and authenticates
-regular non-symlink manifests under per-file and aggregate byte limits before
-loading the base model.
+and dependency maps to cover the locked patch set exactly, and is parsed only
+from bounded canonical JSON. Before the base model or any patch is loaded, the
+referenced-manifest preflight requires regular paths with no symlink traversal,
+enforces per-file and aggregate byte limits, authenticates each manifest-file
+hash, strictly parses and validates the manifest, and requires its `patch_id` to
+equal the corresponding `patch_hashes` key. Before model loading, the same
+preflight parses and authenticates any canonical Rebase Evidence and companion
+source-manifest records carried by each input or resolved patch, along with all
+of their executable target/guard contracts. It validates contract roles against
+`provides`/`preserves`,
+checks the resolved certificate and artifact projection, checks the locked full
+base and contract identities against the referenced manifests, and validates
+the recorded dependency order against their declared requirements and
+providers. Input and resolved manifests together may reference at most 100,000
+artifacts. A recomputed lockfile cannot substitute a different valid manifest
+under an old patch identity. A data-only core lock without path metadata remains
+useful for content exchange, but a consumer cannot claim external-artifact
+validation without caller-supplied references or expectations.
 
 Revert evidence uses these grades:
 
@@ -342,7 +379,21 @@ aggregate pass contain permitted prompt-level failures while preventing a
 re-hashed certificate from relabeling an out-of-policy continuous value as PASS.
 
 Parsing a bundled certificate validates its strict field set, self-hash, digest
-syntax, known claim names, and selected claim/evidence consistency. The
+syntax, known claim names, and selected claim/evidence consistency. A concrete
+Rebase Evidence record embedded in `rebase_result` is parsed by the same Rebase
+Evidence v1 rules and its repeated source patch, source base, target base, and
+claim fields must agree. Its artifact set MUST include both
+`evidence/rebase.json` and `evidence/source-manifest.json`; `NOT_APPLICABLE`
+remains an explicit distinct shape. When an artifact root is supplied,
+validation also strictly parses the canonical target `manifest.json`, both
+lineage artifacts, and the executable contracts. The target manifest and parsed
+contract documents bind `new_patched_behavior` to target contracts and
+`new_base_preservation` to guard contracts, rather than accepting their union as
+an interchangeable set. `rebase_result` records the packaging-time rebase
+lineage, not the outcome of this execution, so a re-verified rebased bundle that
+now fails its contracts still emits a `FAIL` certificate carrying that lineage.
+`RebaseClaim` values are not admissible in `claims`; a rebase claim is asserted
+only through a strictly parsed `rebase_result`. The
 `patch_id` and flattened `base_signature`, like every other certificate digest,
 MUST be exactly `sha256:` followed by 64 lowercase hexadecimal digits. It does
 not re-execute a model. `independently_verify` instead hashes a caller-declared
@@ -396,11 +447,49 @@ source patch ID, source/target base hashes, claim, compatibility classification,
 whether direct transfer was attempted and its outcome, whether recompilation was
 attempted, executed step/restart counts, budget exhaustion, old-patched behavior
 margins, new-patched behavior margins, new-base preservation margins, before/
-after complexity summaries, and warnings. It does not currently embed the
-candidate artifact hash, original contracts, CEGIS/minimization traces, or a
-holdout record. There is no dedicated strict Rebase Evidence reader or content
-hash; those richer fields can be carried separately in patch evidence and a
-verification certificate.
+after complexity summaries, warnings, and `evidence_hash`. The evidence hash is
+the lowercase tagged SHA-256 hash of the complete canonical record payload with
+`evidence_hash` omitted. It detects an un-rehashed mutation but, like every R1
+hash, does not authenticate a publisher.
+
+The Rebase Evidence v1 reader accepts only bounded canonical JSON with the exact
+closed field set. It rejects duplicate keys, missing or unknown fields, unknown
+schema/claim/compatibility/outcome values, malformed identities, a stale
+`evidence_hash`, non-finite metrics, negative or out-of-range counts and
+complexities, oversized strings or collections, and inconsistent attempt,
+outcome, budget, and claim state. In particular,
+`DIRECT_TRANSPLANT_VERIFIED` requires an attempted passing direct transfer on a
+directly compatible physical schema and no recompile; a semantic verified claim
+requires executed recompilation and passing finite target/preservation margins.
+No-recompile records have zero recompile counts and cannot report budget
+exhaustion. Recomputing `evidence_hash` after changing those fields does not make
+an inconsistent claim valid.
+
+Callers may pin the evidence hash, source patch ID, source base hash, target base
+hash, claim, source target-contract identity set, target-contract identity set,
+and preservation-contract identity set as external expectations. Expectation
+validation happens in addition to the self-hash and semantic checks. A
+successful rebased Behavior Patch Bundle MUST carry both canonical
+`evidence/rebase.json` and canonical `evidence/source-manifest.json`. The source
+manifest MUST self-validate, its `patch_id` MUST equal the target manifest's
+`rebased_from`, and its full base signature and `provides` set bind
+`source_base_hash` and `old_patched_behavior`. The target manifest's full base
+signature, `provides`, and `preserves` bind `target_base_hash`,
+`new_patched_behavior`, and `new_base_preservation`. Repeated certificate rebase
+fields and its nested evidence must agree with the artifact record as well. With
+an artifact root, certificate validation additionally parses the target
+manifest and executable contracts so target and guard roles cannot be swapped
+while retaining the same identity union. The record still does not embed the
+candidate artifact, contract documents, CEGIS/minimization traces, or a holdout
+record; those are bound by the containing bundle manifest and verification
+certificate.
+
+On unsuccessful CLI orchestration, a file named `rebase-evidence.json` is a
+diagnostic command report and may wrap a bare Rebase Evidence record together
+with failure, CEGIS, or verification details. It is not itself Rebase Evidence
+v1 and MUST NOT be passed to the bare-record reader or treated as a verified
+claim. Successful rebased bundles carry the bare normative record at
+`evidence/rebase.json`.
 
 `DIRECT_TRANSPLANT_VERIFIED` requires an actually applied delta and passing old
 targets, old guards, and new-base preservation checks. Different architectures
@@ -443,3 +532,16 @@ treated as data only. The loader validates regular-file status, total file size,
 key count/name, and tensor element count, but the current implementation does
 not separately pre-parse and bound every SafeTensors metadata field before
 opening the container.
+
+Rebase Evidence permits 16 MiB, depth 16, 500,000 total nodes,
+4,096-character strings, 100,000 behavior references per behavior map, 1,024
+complexity metrics per summary, and 10,000 warnings. Executed step/restart counts
+are non-negative signed 32-bit integers; integral complexity values are
+non-negative signed 64-bit integers. Patch Stack Lockfiles permit 16 MiB, depth
+16, 150,000 total nodes, 10,000 keys per object, 4,096 patches, 100,000 contract
+identities, 4,096-character embedded local paths, and 100,000 aggregate artifact
+references across input and resolved patch manifests. Referenced manifests,
+rebase/source records, executable contracts, and the resolved certificate are
+preflighted under a 512 MiB aggregate limit in addition to their per-file limits.
+These bounds are checked before higher-level rebase, resolution, revert, or
+model-loading logic consumes the records.

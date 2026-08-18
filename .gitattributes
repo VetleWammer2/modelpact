@@ -1,0 +1,13 @@
+# Artifact bytes are hashed, not their line endings. Without this, a checkout
+# with core.autocrlf=true rewrites committed JSON, JSONL, YAML, Markdown and
+# generated Python to CRLF, and every artifact_hashes entry stops matching.
+*.json text eol=lf
+*.jsonl text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+*.safetensors binary
+*.parquet binary

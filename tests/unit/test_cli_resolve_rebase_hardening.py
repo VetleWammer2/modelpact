@@ -427,6 +427,40 @@ def test_rebase_executes_contract_union_and_explicit_new_base_policy(tmp_path: P
     )
     assert independent.exit_code == 0, independent.stdout
 
+    probes = tmp_path / "probes"
+    probes.mkdir()
+    (probes / "validation.jsonl").write_text('{"id":"v","prompt":"x"}\n', encoding="utf-8")
+    failing = _contract(manifest, "impossible-target", targets=True, guards=False, target_length=5)
+    failing_path = tmp_path / "failing-policy.json"
+    failing_path.write_text(json.dumps(failing.to_dict(), sort_keys=True), encoding="utf-8")
+    regressed = RUNNER.invoke(
+        app,
+        [
+            "verify",
+            str(output),
+            "--base",
+            str(checkpoint),
+            "--adapter",
+            "tiny",
+            "--policy",
+            str(failing_path),
+            "--json",
+        ],
+    )
+
+    # A rebased bundle that no longer satisfies its contracts must still produce
+    # a FAIL certificate carrying its rebase lineage, not a parser error.
+    assert regressed.exit_code == 2, regressed.stdout
+    regressed_payload = json.loads(regressed.stdout)
+    assert regressed_payload["status"] == "FAIL"
+    regressed_certificate = regressed_payload["certificate"]
+    assert regressed_certificate["verification_outcome"] == "FAIL"
+    assert regressed_certificate["rebase_result"]["claim"] == "DIRECT_TRANSPLANT_VERIFIED"
+    assert not {
+        "DIRECT_TRANSPLANT_VERIFIED",
+        "SEMANTIC_REBASE_VERIFIED",
+    } & set(regressed_certificate["claims"])
+
 
 def test_rebase_rejects_a_source_patched_teacher_that_fails_contracts(
     tmp_path: Path,

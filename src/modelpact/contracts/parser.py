@@ -182,6 +182,12 @@ def _validate_document_shape(value: object, limits: ContractLimits) -> None:
             for key, child in item.items():
                 if not isinstance(key, str):
                     _fail(path, "object keys must be strings")
+                if len(key) > limits.max_string_length:
+                    raise ContractResourceLimitError(
+                        f"{path}: object key exceeds {limits.max_string_length} characters"
+                    )
+                if "\x00" in key:
+                    _fail(path, "NUL characters are not permitted in object keys")
                 stack.append((child, depth + 1, f"{path}.{key}"))
             # Since YAML aliases are disallowed, seeing an object again is not
             # useful; remove it after its children have been scheduled.
@@ -199,13 +205,27 @@ def _validate_document_shape(value: object, limits: ContractLimits) -> None:
         _fail(path, f"unsupported data type {type(item).__name__}")
 
 
+def validate_data_shape(value: object, *, limits: ContractLimits = DEFAULT_LIMITS) -> None:
+    """Apply the shared hostile-data resource policy to an in-memory value."""
+
+    _validate_document_shape(value, limits)
+
+
 def loads_data(
     text: str | bytes,
     *,
     format: str,
     limits: ContractLimits = DEFAULT_LIMITS,
+    require_canonical: bool = False,
 ) -> JsonValue:
-    """Parse a bounded JSON or safe-YAML document without interpreting a schema."""
+    """Parse a bounded JSON or safe-YAML document without interpreting a schema.
+
+    When ``require_canonical`` is true, JSON input must be exactly the ModelPact
+    canonical encoding, optionally followed by one LF written by artifact
+    writers.  This mode deliberately rejects BOMs, CRLF, insignificant
+    whitespace, alternate escapes, and non-canonical number spellings instead
+    of silently normalizing an untrusted content-addressed record.
+    """
 
     raw = text.encode("utf-8") if isinstance(text, str) else text
     if len(raw) > limits.max_bytes:
@@ -243,6 +263,12 @@ def loads_data(
     except (json.JSONDecodeError, UnicodeError) as error:
         raise ContractSyntaxError(f"malformed JSON: {error}") from error
     _validate_document_shape(value, limits)
+    if require_canonical:
+        if normalized_format != "json":
+            raise ContractSyntaxError("canonical representation is defined only for JSON")
+        canonical = canonical_dumps(value, max_depth=limits.max_depth).encode("utf-8")
+        if raw not in {canonical, canonical + b"\n"}:
+            raise ContractSyntaxError("JSON document is not in canonical ModelPact encoding")
     return cast(JsonValue, value)
 
 
@@ -250,6 +276,7 @@ def load_data_file(
     path: str | Path,
     *,
     limits: ContractLimits = DEFAULT_LIMITS,
+    require_canonical: bool = False,
 ) -> JsonValue:
     source = Path(path)
     try:
@@ -265,7 +292,12 @@ def load_data_file(
         data = source.read_bytes()
     except OSError as error:
         raise ContractSyntaxError(f"cannot read {source}: {error}") from error
-    return loads_data(data, format=suffix, limits=limits)
+    return loads_data(
+        data,
+        format=suffix,
+        limits=limits,
+        require_canonical=require_canonical,
+    )
 
 
 def _mapping(value: object, path: str) -> Mapping[str, object]:
@@ -804,4 +836,5 @@ __all__ = [
     "loads_data",
     "parse_contract",
     "resolve_contract_resource",
+    "validate_data_shape",
 ]
