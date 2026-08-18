@@ -1077,6 +1077,27 @@ def apply_command(
     _invoke(operation, compact=json_output)
 
 
+def _bundled_new_base_guard_ids(bundle: Any) -> list[str]:
+    """Carry forward which preservation contracts the new base imposed.
+
+    Re-execution cannot re-derive this: nothing in the delta, the contracts or
+    the Rebase Evidence records which guards came from `--new-base-policy`.
+    Emitting an empty list would assert there were none, so the value is read
+    from the bundled certificate, where the certificate parser re-checks it
+    against the independently parsed evidence.
+    """
+
+    from modelpact.verify.certificate import read_certificate
+
+    if "certificate.json" not in bundle.manifest.artifact_hashes:
+        return []
+    bundled = read_certificate(bundle.path / "certificate.json")
+    guard_ids = bundled.rebase_result.get("new_base_guard_ids")
+    if not isinstance(guard_ids, list) or not all(isinstance(item, str) for item in guard_ids):
+        raise ValueError("bundled certificate has malformed rebase new_base_guard_ids")
+    return list(cast(list[str], guard_ids))
+
+
 @app.command("verify")
 def verify_command(
     patch: Path = typer.Argument(..., exists=True),
@@ -1145,7 +1166,7 @@ def verify_command(
             rebase_result = {
                 "claim": rebase_evidence.claim.value,
                 "evidence": rebase_evidence.to_dict(),
-                "new_base_guard_ids": [],
+                "new_base_guard_ids": _bundled_new_base_guard_ids(bundle),
                 "source_base_hash": rebase_evidence.source_base_hash,
                 "source_patch_id": rebase_evidence.source_patch_id,
                 "target_base_hash": rebase_evidence.target_base_hash,

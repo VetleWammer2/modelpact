@@ -1258,8 +1258,9 @@ def test_locked_patch_paths_must_be_unique(tmp_path: Path) -> None:
     patch_paths[dependent_id] = patch_paths[provider_id]
     _write_canonical(lock, value)
 
+    parsed = _read_lock(lock)
+
     with pytest.raises(ValueError, match="path.*unique|duplicate.*path"):
-        parsed = _read_lock(lock)
         _verify_locked_patch_manifests(parsed)
 
 

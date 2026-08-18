@@ -427,6 +427,13 @@ def test_rebase_executes_contract_union_and_explicit_new_base_policy(tmp_path: P
     )
     assert independent.exit_code == 0, independent.stdout
 
+    # Re-execution cannot re-derive which guards the new base imposed, so the
+    # regenerated certificate must carry them rather than assert there were none.
+    packaged_guard_ids = certificate["rebase_result"]["new_base_guard_ids"]
+    assert packaged_guard_ids
+    regenerated = json.loads(independent.stdout)["certificate"]
+    assert regenerated["rebase_result"]["new_base_guard_ids"] == packaged_guard_ids
+
     probes = tmp_path / "probes"
     probes.mkdir()
     (probes / "validation.jsonl").write_text('{"id":"v","prompt":"x"}\n', encoding="utf-8")
