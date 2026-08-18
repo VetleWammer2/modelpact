@@ -270,7 +270,13 @@ def validate_rebase_evidence_artifact(root: Path, manifest: PatchManifest) -> No
             source_patch_id=manifest.rebased_from,
             source_base_hash=source_signature,
             target_base_hash=target_signature,
-            source_contract_ids=frozenset(source_manifest.provides),
+            # A semantic rebase re-measures the source patched model on every
+            # contract the source bundle carries, not only the target-bearing
+            # ones, so the binding is provides plus preserves. Restricting it to
+            # provides rejects any source bundle holding a guard-only
+            # preservation contract.
+            source_contract_ids=frozenset(source_manifest.provides)
+            | frozenset(source_manifest.preserves),
             target_contract_ids=frozenset(manifest.provides),
             preservation_contract_ids=frozenset(
                 f"{identifier}:guards" for identifier in manifest.preserves

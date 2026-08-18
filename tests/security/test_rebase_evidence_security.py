@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from modelpact.patch.bundle import create_patch_bundle, load_patch_bundle
 from modelpact.rebase.direct import RebaseCompatibility
 from modelpact.rebase.evidence import (
     MAX_REBASE_EVIDENCE_BYTES,
+    MAX_REBASE_REFERENCE_CHARS,
     RebaseEvidence,
     RebaseEvidenceExpectations,
     loads_rebase_evidence,
@@ -53,7 +55,10 @@ def _evidence(
     target_contract_id: str = _digest(4),
     preservation_contract_id: str = _digest(5),
     old_contract_id: str | None = None,
+    old_patched_behavior: Mapping[str, float] | None = None,
 ) -> RebaseEvidence:
+    if old_patched_behavior is None:
+        old_patched_behavior = {old_contract_id or target_contract_id: 0.75}
     return RebaseEvidence(
         source_patch_id=source_patch_id,
         source_base_hash=source_base_hash,
@@ -66,7 +71,7 @@ def _evidence(
         recompile_steps=17,
         recompile_restarts=1,
         budget_exhausted=False,
-        old_patched_behavior={old_contract_id or target_contract_id: 0.75},
+        old_patched_behavior=old_patched_behavior,
         new_patched_behavior={target_contract_id: 0.5},
         new_base_preservation={f"{preservation_contract_id}:guards": 0.25},
         patch_complexity_before={"parameters": 64, "target_tensors": 2},
@@ -454,7 +459,9 @@ def test_rehashed_malformed_core_identities_are_rejected(field: str, malformed: 
         ("new_patched_behavior", "../substituted-contract"),
         ("new_base_preservation", "C:/ambiguous"),
         ("new_base_preservation", "\x00truncated"),
-        ("new_patched_behavior", "x" * 129),
+        ("new_patched_behavior", "x" * (MAX_REBASE_REFERENCE_CHARS + 1)),
+        ("new_patched_behavior", " leading-space"),
+        ("old_patched_behavior", ".."),
     ],
 )
 def test_rehashed_malformed_contract_reference_is_rejected(
@@ -839,6 +846,18 @@ def _rebase_bundle(tmp_path: Path) -> tuple[Path, str, str, str, str]:
     source_model_requirements["base_signature"] = source_base_hash
     source_contract = parse_contract(source_contract_value)
     assert source_contract.contract_id != contract.contract_id
+    # A guard-only preservation contract, which the source bundle lists in
+    # preserves but not provides. A semantic rebase still measures the source
+    # patched model on it, so its identity must be admissible in
+    # old_patched_behavior.
+    source_guard_value: dict[str, Any] = copy.deepcopy(source_contract_value)
+    source_guard_value["id"] = "rebase-evidence-source-guard"
+    source_guard_verify = source_guard_value["verify"]
+    assert isinstance(source_guard_verify, dict)
+    source_guard_verify["targets"] = []
+    source_guard_value["compile"] = {"objectives": []}
+    source_guard_contract = parse_contract(source_guard_value)
+    assert not source_guard_contract.targets
     source_bundle = create_patch_bundle(
         tmp_path / "source-patch",
         name="rebase-evidence-source",
@@ -848,11 +867,12 @@ def _rebase_bundle(tmp_path: Path) -> tuple[Path, str, str, str, str]:
         tensors={"delta": torch.zeros(8)},
         tool_version="0.1.0",
         contracts={
+            "contracts/contract-guard.yaml": _record_bytes(source_guard_contract.to_dict()),
             "contracts/preservation.yaml": _record_bytes(source_contract.to_dict()),
             "contracts/target.yaml": _record_bytes(source_contract.to_dict()),
         },
         provides=(source_contract.contract_id,),
-        preserves=(source_contract.contract_id,),
+        preserves=tuple(sorted({source_contract.contract_id, source_guard_contract.contract_id})),
     )
     source_patch_id = source_bundle.manifest.patch_id
     evidence = _evidence(
@@ -861,7 +881,10 @@ def _rebase_bundle(tmp_path: Path) -> tuple[Path, str, str, str, str]:
         target_base_hash=signature.signature_hash,
         target_contract_id=contract.contract_id,
         preservation_contract_id=contract.contract_id,
-        old_contract_id=source_contract.contract_id,
+        old_patched_behavior={
+            source_contract.contract_id: 0.75,
+            source_guard_contract.contract_id: 0.5,
+        },
     )
     bundle = create_patch_bundle(
         tmp_path / "rebased-patch",
@@ -891,6 +914,28 @@ def _rebase_bundle(tmp_path: Path) -> tuple[Path, str, str, str, str]:
         contract.contract_id,
         source_contract.contract_id,
     )
+
+
+def test_rebased_bundle_with_a_guard_only_source_contract_loads(tmp_path: Path) -> None:
+    """A semantic rebase measures the source model on its guard-only contracts.
+
+    Binding old_patched_behavior to the source manifest's provides alone would
+    reject every source bundle carrying a preservation-only contract, which is
+    the layout `modelpact rebase --new-base-policy` and the composite merge
+    writer both produce.
+    """
+
+    bundle, _source_patch_id, _target_base_hash, _contract_id, _source_contract_id = _rebase_bundle(
+        tmp_path
+    )
+    source_manifest = json.loads(
+        (bundle / "evidence" / "source-manifest.json").read_text(encoding="utf-8")
+    )
+    evidence = json.loads((bundle / "evidence" / "rebase.json").read_text(encoding="utf-8"))
+
+    assert len(source_manifest["preserves"]) == 2
+    assert set(evidence["old_patched_behavior"]) - set(source_manifest["provides"])
+    assert load_patch_bundle(bundle).manifest.rebased_from == source_manifest["patch_id"]
 
 
 @pytest.mark.parametrize(

@@ -472,8 +472,10 @@ validation happens in addition to the self-hash and semantic checks. A
 successful rebased Behavior Patch Bundle MUST carry both canonical
 `evidence/rebase.json` and canonical `evidence/source-manifest.json`. The source
 manifest MUST self-validate, its `patch_id` MUST equal the target manifest's
-`rebased_from`, and its full base signature and `provides` set bind
-`source_base_hash` and `old_patched_behavior`. The target manifest's full base
+`rebased_from`, and its full base signature and combined `provides`/`preserves`
+sets bind `source_base_hash` and `old_patched_behavior`. A semantic rebase
+re-measures the source patched model on every contract the source bundle
+carries, including preservation-only ones. The target manifest's full base
 signature, `provides`, and `preserves` bind `target_base_hash`,
 `new_patched_behavior`, and `new_base_preservation`. Repeated certificate rebase
 fields and its nested evidence must agree with the artifact record as well. With
@@ -535,7 +537,12 @@ opening the container.
 
 Rebase Evidence permits 16 MiB, depth 16, 500,000 total nodes,
 4,096-character strings, 100,000 behavior references per behavior map, 1,024
-complexity metrics per summary, and 10,000 warnings. Executed step/restart counts
+complexity metrics per summary, and 10,000 warnings. A behavior or complexity
+reference key is a nonempty string of at most 256 characters carrying no path
+separator, control character, surrounding whitespace, or bare `.`/`..`
+spelling. Contract identifiers are otherwise unconstrained, so the reader bounds
+key shape and leaves identity binding to caller expectations. Executed
+step/restart counts
 are non-negative signed 32-bit integers; integral complexity values are
 non-negative signed 64-bit integers. Patch Stack Lockfiles permit 16 MiB, depth
 16, 150,000 total nodes, 10,000 keys per object, 4,096 patches, 100,000 contract

@@ -10,7 +10,6 @@ through :class:`RebaseEvidenceExpectations`.
 from __future__ import annotations
 
 import math
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,7 +39,7 @@ _REBASE_EVIDENCE_LIMITS = ContractLimits(
     max_objectives=1,
     max_assertions=1,
 )
-_REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+MAX_REBASE_REFERENCE_CHARS = 256
 _PAYLOAD_FIELDS = frozenset(
     {
         "budget_exhausted",
@@ -180,9 +179,24 @@ def _execution_count(value: object, name: str) -> int:
 
 
 def _reference(value: object, name: str) -> str:
-    if not isinstance(value, str) or _REFERENCE_PATTERN.fullmatch(value) is None:
+    """Bound a contract reference without imposing a charset the schema lacks.
+
+    A Behavior Contract identifier is an unconstrained bounded string, so this
+    rejects only what makes a map key dangerous or ambiguous: path separators
+    and traversal spellings, control characters, and surrounding whitespace.
+    """
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_REBASE_REFERENCE_CHARS
+        or value in {".", ".."}
+        or value != value.strip()
+        or any(character in value for character in "/\\")
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
         raise RebaseEvidenceError(
-            f"{name} must be a bounded stable reference matching {_REFERENCE_PATTERN.pattern!r}"
+            f"{name} must be a bounded reference without separators or control characters"
         )
     return value
 
@@ -324,17 +338,20 @@ def _validate_semantics(evidence: RebaseEvidence) -> None:
                 "DIRECT_TRANSPLANT_VERIFIED is inconsistent with its execution evidence"
             )
     elif evidence.claim is RebaseClaim.SEMANTIC_REBASE_VERIFIED:
+        # recompile_restarts and patch_complexity_after are deliberately not
+        # constrained here. BehavioralRecompileResult permits zero restarts and
+        # defaults complexity to {}, so a third-party recompiler that converges
+        # on its first attempt would otherwise produce a verified rebase that
+        # cannot be serialized.
         if (
             incompatible
             or not evidence.recompile_attempted
             or evidence.recompile_steps <= 0
-            or evidence.recompile_restarts <= 0
             or evidence.budget_exhausted
             or direct_outcome is VerificationOutcome.PASS
             or not _all_nonnegative(evidence.old_patched_behavior)
             or not _all_nonnegative(evidence.new_patched_behavior)
             or not _all_nonnegative(evidence.new_base_preservation)
-            or not evidence.patch_complexity_after
         ):
             raise RebaseEvidenceIntegrityError(
                 "SEMANTIC_REBASE_VERIFIED is inconsistent with its execution evidence"
@@ -550,6 +567,7 @@ def write_rebase_evidence(
 __all__ = [
     "MAX_REBASE_EVIDENCE_BYTES",
     "MAX_REBASE_EVIDENCE_CONTRACTS",
+    "MAX_REBASE_REFERENCE_CHARS",
     "REBASE_EVIDENCE_FIELDS",
     "RebaseEvidence",
     "RebaseEvidenceError",
