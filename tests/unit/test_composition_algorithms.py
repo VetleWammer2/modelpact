@@ -318,22 +318,46 @@ def test_semantic_merge_reports_budgeted_empirical_infeasibility_honestly() -> N
 
 
 def test_stack_resolution_is_identity_ordered_and_dependency_checked() -> None:
-    base = "sha256:base"
-    first = PatchReference("a", "ha", base, ("ca",), "aa")
-    second = PatchReference("b", "hb", base, ("cb",), "ab", requires=("ca",))
-    assert dependency_order([second, first]) == ("a", "b")
+    def digest(index: int) -> str:
+        return f"sha256:{index:064x}"
+
+    base = digest(1)
+    first_id, second_id = digest(2), digest(3)
+    first_contract, second_contract = digest(4), digest(5)
+    first = PatchReference(
+        first_id,
+        digest(6),
+        base,
+        (first_contract,),
+        digest(7),
+        provides=(first_contract,),
+    )
+    second = PatchReference(
+        second_id,
+        digest(8),
+        base,
+        (second_contract,),
+        digest(9),
+        requires=(first_contract,),
+        provides=(second_contract,),
+    )
+    assert dependency_order([second, first]) == (first_id, second_id)
 
     resolved = resolve_stack(
         base_hash=base,
         patches=[second, first],
         resolver=lambda request: StackResolutionExecution(
             StackResolutionKind.NAIVE_ADDITIVE_STACK,
-            "resolved",
-            "policy",
-            "union",
+            digest(10),
+            digest(11),
+            digest(12),
+            certificate_hash=digest(13),
         ),
         repair_conflicts=False,
         subset_audit_budget=8,
     )
-    assert tuple(patch.patch_id for patch in resolved.request.patches) == ("a", "b")
-    assert resolved.lock.to_dict()["patch_hashes"] == {"a": "ha", "b": "hb"}
+    assert tuple(patch.patch_id for patch in resolved.request.patches) == (first_id, second_id)
+    assert resolved.lock.to_dict()["patch_hashes"] == {
+        first_id: digest(6),
+        second_id: digest(8),
+    }

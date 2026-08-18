@@ -47,6 +47,3 @@
   committed.
 - The general GPU path is not supported by committed execution evidence until a
   recorded GPU run exists.
-- Rebase evidence records do not yet have a complete dedicated hostile-data
-  parser; the exact parser boundary is documented in `SPEC.md`. Patch Stack
-  Lockfile v1 has a strict core and CLI-extension parser.

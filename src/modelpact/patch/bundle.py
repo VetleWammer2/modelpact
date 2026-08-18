@@ -18,7 +18,8 @@ from modelpact.patch.tensors import load_patch_tensors, save_patch_tensors
 from modelpact.patch.validate import load_delta_program
 from modelpact.util.atomic import atomic_write_bytes, atomic_write_text
 from modelpact.util.canonical_json import CanonicalJSONError, canonical_dumps, strict_json_loads
-from modelpact.util.hashing import sha256_file
+from modelpact.util.hashing import sha256_bytes, sha256_file
+from modelpact.util.paths import safe_relative_path
 
 MAX_MANIFEST_BYTES = 16 * 1024**2
 MAX_SUPPLEMENTAL_ARTIFACT_BYTES = 512 * 1024**2
@@ -26,6 +27,8 @@ MAX_BUNDLE_ARTIFACTS = 10_000
 MAX_BUNDLE_ARTIFACT_BYTES = 512 * 1024**2
 MAX_BUNDLE_TENSOR_BYTES = 16 * 1024**3
 MAX_BUNDLE_AGGREGATE_BYTES = MAX_BUNDLE_TENSOR_BYTES + MAX_SUPPLEMENTAL_ARTIFACT_BYTES
+REBASE_EVIDENCE_PATH = "evidence/rebase.json"
+REBASE_SOURCE_MANIFEST_PATH = "evidence/source-manifest.json"
 MANDATORY_BUNDLE_ARTIFACTS = frozenset(
     {
         "delta-program.json",
@@ -47,22 +50,19 @@ MANDATORY_BUNDLE_ARTIFACTS = frozenset(
 
 
 def _safe_relative(path: str) -> str:
-    normalized = path.replace("\\", "/")
-    candidate = Path(normalized)
-    if (
-        not path
-        or candidate.is_absolute()
-        or bool(candidate.drive)
-        or ".." in candidate.parts
-        or any(part in {"", "."} for part in candidate.parts)
-    ):
-        raise ValueError(f"unsafe bundle path: {path}")
-    return candidate.as_posix()
+    try:
+        return safe_relative_path(path).as_posix()
+    except ValueError as error:
+        raise ValueError(f"unsafe bundle path: {path}") from error
 
 
 def _bundle_file(root: Path, relative: str) -> Path:
     safe = _safe_relative(relative)
-    unresolved = root / Path(safe)
+    unresolved = root
+    for part in Path(safe).parts:
+        unresolved /= part
+        if unresolved.is_symlink():
+            raise ValueError(f"bundle artifact path contains a symlink: {safe}")
     if unresolved.is_symlink() or not unresolved.is_file():
         raise ValueError(f"bundle artifact must be a regular file: {safe}")
     resolved_root = root.resolve()
@@ -91,6 +91,12 @@ def bundle_artifact_size_limit(relative: str) -> int:
     if safe == "tensors.safetensors":
         return MAX_BUNDLE_TENSOR_BYTES
     if safe == "delta-program.json":
+        return MAX_MANIFEST_BYTES
+    if safe == REBASE_EVIDENCE_PATH:
+        from modelpact.rebase.evidence import MAX_REBASE_EVIDENCE_BYTES
+
+        return MAX_REBASE_EVIDENCE_BYTES
+    if safe == REBASE_SOURCE_MANIFEST_PATH:
         return MAX_MANIFEST_BYTES
     if safe.startswith(("contracts/", "probes/", "evidence/")):
         return MAX_BUNDLE_ARTIFACT_BYTES
@@ -131,7 +137,7 @@ def require_complete_bundle(manifest: PatchManifest) -> None:
         raise ValueError(f"patch bundle is incomplete; missing artifacts: {list(missing)}")
 
 
-def _is_executable_contract_path(relative: str) -> bool:
+def is_executable_contract_path(relative: str) -> bool:
     path = Path(relative)
     if path.suffix.lower() not in {".json", ".yaml", ".yml"}:
         return False
@@ -143,7 +149,7 @@ def _is_executable_contract_path(relative: str) -> bool:
     )
 
 
-def _validate_contract_claims(root: Path, manifest: PatchManifest) -> None:
+def validate_contract_artifacts(root: Path, manifest: PatchManifest) -> None:
     """Bind manifest claims to the executable, content-addressed contracts."""
 
     from modelpact.contracts.ast import BehaviorContract
@@ -151,7 +157,7 @@ def _validate_contract_claims(root: Path, manifest: PatchManifest) -> None:
 
     contracts: dict[str, BehaviorContract] = {}
     for relative in sorted(manifest.artifact_hashes):
-        if not _is_executable_contract_path(relative):
+        if not is_executable_contract_path(relative):
             continue
         contract = load_contract(_bundle_file(root, relative))
         prior = contracts.get(contract.contract_id)
@@ -174,6 +180,114 @@ def _validate_contract_claims(root: Path, manifest: PatchManifest) -> None:
             "manifest preserves claims do not match embedded guard contracts: "
             f"claimed={list(manifest.preserves)}, embedded={list(guard_contracts)}"
         )
+
+
+def _pinned_artifact_bytes(
+    root: Path,
+    manifest: PatchManifest,
+    relative: str,
+    *,
+    limit: int,
+) -> bytes:
+    path = _bundle_file(root, relative)
+    if path.stat().st_size > limit:
+        raise ValueError(f"patch artifact exceeds size limit: {relative}")
+    raw = path.read_bytes()
+    if len(raw) > limit:
+        raise ValueError(f"patch artifact exceeds size limit: {relative}")
+    expected = manifest.artifact_hashes.get(relative)
+    if expected is None or sha256_bytes(raw) != expected:
+        raise ValueError(f"patch artifact hash mismatch: {relative}")
+    return raw
+
+
+def validate_rebase_evidence_artifact(root: Path, manifest: PatchManifest) -> None:
+    """Bind a rebased bundle's hostile evidence record to its manifest lineage."""
+
+    evidence_present = REBASE_EVIDENCE_PATH in manifest.artifact_hashes
+    source_present = REBASE_SOURCE_MANIFEST_PATH in manifest.artifact_hashes
+    if manifest.rebased_from is None:
+        if evidence_present or source_present:
+            raise ValueError("non-rebased patch bundle cannot carry rebase lineage artifacts")
+        return
+    if not evidence_present or not source_present:
+        raise ValueError(
+            "rebased patch bundle requires evidence/rebase.json and evidence/source-manifest.json"
+        )
+
+    from modelpact.contracts.parser import ContractLimits, loads_data
+    from modelpact.models.manifest import ModelSignature
+    from modelpact.rebase.evidence import (
+        MAX_REBASE_EVIDENCE_BYTES,
+        RebaseEvidenceExpectations,
+        loads_rebase_evidence,
+        validate_rebase_evidence,
+    )
+    from modelpact.status import RebaseClaim
+
+    source_raw = _pinned_artifact_bytes(
+        root,
+        manifest,
+        REBASE_SOURCE_MANIFEST_PATH,
+        limit=MAX_MANIFEST_BYTES,
+    )
+    source_value = loads_data(
+        source_raw,
+        format="json",
+        limits=ContractLimits(
+            max_bytes=MAX_MANIFEST_BYTES,
+            max_depth=16,
+            max_nodes=150_000,
+            max_string_length=4_096,
+            max_object_keys=10_000,
+            max_objectives=1,
+            max_assertions=1,
+        ),
+        require_canonical=True,
+    )
+    if not isinstance(source_value, Mapping):
+        raise ValueError("rebase source manifest must be an object")
+    source_manifest = PatchManifest.from_dict(source_value)
+    source_manifest.validate_identity()
+    canonical_source = canonical_dumps(source_manifest.to_dict()).encode("utf-8")
+    if source_raw not in {canonical_source, canonical_source + b"\n"}:
+        raise ValueError("rebase source manifest is not the exact canonical v1 representation")
+    if source_manifest.patch_id != manifest.rebased_from:
+        raise ValueError("rebase source manifest identity does not match rebased_from")
+
+    target_signature = ModelSignature.from_dict(manifest.base_signature).signature_hash
+    source_signature = ModelSignature.from_dict(source_manifest.base_signature).signature_hash
+    evidence_raw = _pinned_artifact_bytes(
+        root,
+        manifest,
+        REBASE_EVIDENCE_PATH,
+        limit=MAX_REBASE_EVIDENCE_BYTES,
+    )
+    evidence = loads_rebase_evidence(evidence_raw)
+    validate_rebase_evidence(
+        evidence,
+        expectations=RebaseEvidenceExpectations(
+            source_patch_id=manifest.rebased_from,
+            source_base_hash=source_signature,
+            target_base_hash=target_signature,
+            # A semantic rebase re-measures the source patched model on every
+            # contract the source bundle carries, not only the target-bearing
+            # ones, so the binding is provides plus preserves. Restricting it to
+            # provides rejects any source bundle holding a guard-only
+            # preservation contract.
+            source_contract_ids=frozenset(source_manifest.provides)
+            | frozenset(source_manifest.preserves),
+            target_contract_ids=frozenset(manifest.provides),
+            preservation_contract_ids=frozenset(
+                f"{identifier}:guards" for identifier in manifest.preserves
+            ),
+        ),
+    )
+    if evidence.claim not in {
+        RebaseClaim.DIRECT_TRANSPLANT_VERIFIED,
+        RebaseClaim.SEMANTIC_REBASE_VERIFIED,
+    }:
+        raise ValueError("rebased patch bundle must carry verified Rebase Evidence")
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,7 +389,7 @@ def create_patch_bundle(
             compiler_configuration=dict(compiler_configuration or {}),
         )
         manifest = replace(incomplete, patch_id=incomplete.computed_patch_id())
-        _validate_contract_claims(temporary, manifest)
+        validate_contract_artifacts(temporary, manifest)
         if require_complete:
             require_complete_bundle(manifest)
         atomic_write_text(
@@ -350,7 +464,8 @@ def load_patch_bundle(
         actual = sha256_file(artifact_path, max_bytes=limit)
         if actual != expected:
             raise ValueError(f"patch artifact hash mismatch: {relative}")
-    _validate_contract_claims(root, manifest)
+    validate_rebase_evidence_artifact(root, manifest)
+    validate_contract_artifacts(root, manifest)
     if state_schema is not None and manifest.target_module_schema_hash != state_schema.schema_hash:
         raise ValueError("patch target module schema does not match loaded model")
     program = load_delta_program(_bundle_file(root, "delta-program.json"))

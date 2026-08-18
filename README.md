@@ -206,6 +206,18 @@ remainder. A nonempty additive reconstruction is reported as
 `VERIFIED_LOGICAL_STACK_RECONSTRUCTED`; it is not called an exact runtime unmount,
 numeric inverse, or semantic recompile.
 
+Rebase Evidence and stack lockfiles are parsed as hostile canonical JSON, with
+the same fail-closed duplicate-key, schema, resource-limit, and identity policy
+used for certificates. Rebase Evidence carries a canonical `evidence_hash` plus
+semantic and caller-expectation checks. A rebased bundle also carries canonical
+`evidence/source-manifest.json`, which binds the evidence to the source patch,
+source base, and source target-contract identities. Artifact-root certificate
+validation uses the target manifest and executable contracts to preserve the
+target-versus-guard distinction. Before stack reversion loads a model, it
+authenticates and parses the input and resolved manifests, their rebase/source
+records, and their executable contracts. Failure-side `rebase-evidence.json`
+files are diagnostic CLI reports, not bare verified Rebase Evidence v1 records.
+
 ## CLI
 
 The installed `modelpact` command exposes:
@@ -342,8 +354,13 @@ records, output paths, and lockfiles are untrusted data.
 ModelPact rejects traversal and symlinks across bundle/checkpoint boundaries,
 duplicate JSON keys, nonfinite values, excessive nesting/counts/sizes, unknown
 delta operations, malformed aliases, pickle weights, remote model code, and
-bundle-local adapter imports. Writes use same-filesystem temporary paths and do
-not overwrite source checkpoints. Details are in
+bundle-local adapter imports. Rebase Evidence and stack locks additionally
+require canonical input bytes, closed schemas, canonical digests, semantic
+identity consistency, and referenced-artifact preflight. Portable artifact
+paths reject case-insensitive collisions, Windows reserved names and alternate
+data stream syntax, and components ending in a dot or space. Writes use
+same-filesystem temporary paths and do not overwrite source checkpoints. Details
+are in
 [`docs/trust-model.md`](docs/trust-model.md).
 
 ## Exact limitations

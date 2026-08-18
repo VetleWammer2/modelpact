@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 from modelpact.models.manifest import ModelSignature
 from modelpact.util.hashing import hash_canonical, is_sha256_digest
+from modelpact.util.paths import validate_relative_paths
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,15 +60,21 @@ class PatchManifest:
         ):
             if any(not is_sha256_digest(value) for value in values):
                 raise ValueError(f"{name} must contain contract SHA-256 identities")
+        if not all(isinstance(path, str) for path in self.artifact_hashes):
+            raise ValueError("artifact paths must be strings")
+        try:
+            validate_relative_paths(
+                self.artifact_hashes,
+                reserved_paths=(
+                    "evidence/rebase.json",
+                    "evidence/source-manifest.json",
+                ),
+            )
+        except ValueError as error:
+            raise ValueError("unsafe artifact path or ambiguous artifact spelling") from error
         for path, digest in self.artifact_hashes.items():
-            if (
-                not isinstance(path, str)
-                or not isinstance(digest, str)
-                or not path
-                or path.startswith(("/", "\\"))
-                or ".." in path.replace("\\", "/").split("/")
-            ):
-                raise ValueError(f"unsafe artifact path: {path}")
+            if not isinstance(digest, str):
+                raise ValueError(f"invalid artifact digest: {path}")
             if not is_sha256_digest(digest):
                 raise ValueError(f"invalid artifact digest: {path}")
         if self.verification_policy_hash is not None and not is_sha256_digest(
@@ -86,6 +93,16 @@ class PatchManifest:
         ):
             if value is not None and not is_sha256_digest(value):
                 raise ValueError(f"{name} must be a tagged SHA-256 digest")
+        if not set(self.merged_from).issubset(self.parent_patches):
+            raise ValueError("merged_from must be a subset of parent_patches")
+        if self.rebased_from is not None and (
+            self.parent_patches or self.merged_from or self.source_diff_bundle is not None
+        ):
+            raise ValueError("rebase lineage cannot be combined with parent or source-diff lineage")
+        if self.source_diff_bundle is not None and (
+            self.parent_patches or self.merged_from or self.rebased_from is not None
+        ):
+            raise ValueError("source-diff lineage cannot be combined with patch-parent lineage")
 
     def _payload(self, *, identity_only: bool) -> dict[str, object]:
         artifact_hashes = self.artifact_hashes

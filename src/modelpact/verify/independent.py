@@ -66,6 +66,10 @@ def _prior_differences(
         ("probe_hashes", prior.probe_hashes, current.probe_hashes),
         ("verification_outcome", prior.verification_outcome, current.verification_outcome),
         ("claims", prior.claims, current.claims),
+        # Independent execution does not re-derive a rebase, so a bundled
+        # rebase_result is always reported as differing rather than silently
+        # treated as confirmed by a run that never checked it.
+        ("rebase_result", prior.rebase_result, current.rebase_result),
     )
     for name, old, new in comparisons:
         if old != new:
